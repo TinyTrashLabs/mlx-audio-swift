@@ -79,6 +79,37 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         )
     }
 
+    /// CustomVoice: a fixed preset `speaker` identity steered by a natural-language
+    /// `instruct`. Both compose (unlike the single-string `generate(text:voice:…)`
+    /// entry, which can only carry one of speaker OR instruct).
+    public func generateCustomVoice(
+        text: String,
+        speaker: String,
+        instruct: String?,
+        language: String?,
+        generationParameters: GenerateParameters
+    ) async throws -> MLXArray {
+        try requireGenerationComponents()
+        let settings = resolveVoiceDesignGenerationSettings(
+            language: language,
+            generationParameters: generationParameters
+        )
+        return try generateVoiceDesign(
+            text: text,
+            instruct: instruct,
+            language: settings.language,
+            refAudio: nil,
+            refText: nil,
+            temperature: settings.temperature,
+            topK: settings.topK,
+            topP: settings.topP,
+            repetitionPenalty: settings.repetitionPenalty,
+            minP: settings.minP,
+            maxTokens: settings.maxTokens,
+            speaker: speaker
+        )
+    }
+
     public func generateStream(
         text: String,
         voice: String?,
@@ -316,6 +347,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         repetitionPenalty: Float,
         minP: Float,
         maxTokens: Int,
+        speaker: String? = nil,
         streamingInterval: Double = 2.0,
         onToken: ((Int) -> Void)? = nil,
         onInfo: ((AudioGenerationInfo) -> Void)? = nil,
@@ -358,15 +390,28 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             ttsPadEmbed = prepared.2
             refCodes = prepared.3
         } else {
-            // For CustomVoice models: voice is a speaker name, not free-text instruct.
+            // Resolve speaker + instruct. An explicit `speaker` (from generateCustomVoice)
+            // carries both speaker and instruct together. Legacy single-string path: for
+            // CustomVoice models the `voice` string is the speaker; for base/voicedesign it
+            // is the instruct.
             let isCVModel = config.ttsModelType == "custom_voice"
-            let speaker: String? = isCVModel ? instruct : nil
-            let effectiveInstruct: String? = isCVModel ? nil : instruct
+            let effectiveSpeaker: String?
+            let effectiveInstruct: String?
+            if let speaker {
+                effectiveSpeaker = speaker
+                effectiveInstruct = (instruct?.isEmpty == false) ? instruct : nil
+            } else if isCVModel {
+                effectiveSpeaker = instruct
+                effectiveInstruct = nil
+            } else {
+                effectiveSpeaker = nil
+                effectiveInstruct = instruct
+            }
             let prepared = prepareGenerationInputs(
                 text: text,
                 language: language,
                 instruct: effectiveInstruct,
-                speaker: speaker
+                speaker: effectiveSpeaker
             )
             inputEmbedsInit = prepared.0
             trailingTextHidden = prepared.1
