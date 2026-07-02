@@ -462,14 +462,21 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
         }
 
-        let encoded = tokenizer.encode(text: text)
-
         if config.meanflow {
             // Turbo: GPT-2 tokenizer — use raw token IDs, no SOT/EOT wrapping
+            let encoded = tokenizer.encode(text: text)
             let ids = encoded.map { Int32($0) }
             return MLXArray(ids).reshaped([1, -1])
         } else {
-            // Regular (LLaMA): custom EnTokenizer — wrap with SOT/EOT
+            // Regular (LLaMA): custom EnTokenizer. Its vocab has no literal space
+            // character at all — spaces must be the literal "[SPACE]" special-token
+            // string before BPE encoding, matching Python EnTokenizer.encode's
+            // `txt.replace(' ', SPACE)`. Skipping this collapses every word boundary
+            // (e.g. "I am testing" tokenizes as "I"/"am"/"t"/"es"/"ing" with no space
+            // marker anywhere), which is why regular Chatterbox's speech is
+            // unintelligible — the model never saw space-free input during training.
+            let spaceMarked = text.replacingOccurrences(of: " ", with: "[SPACE]")
+            let encoded = tokenizer.encode(text: spaceMarked)
             var ids = [Int32(sotToken)]
             ids.append(contentsOf: encoded.map { Int32($0) })
             ids.append(Int32(eotToken))
@@ -948,7 +955,27 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         let weights = try loadChatterboxWeights(modelDir: modelDir)
 
         // Sanitize weights
-        let sanitizedWeights = model.sanitize(weights: weights)
+        var sanitizedWeights = model.sanitize(weights: weights)
+
+        // The mlx-community Regular conversion dropped the flow estimator's 56
+        // trained `attn1.to_out.0.bias` vectors (present in the original ResembleAI
+        // torch checkpoint and in the Turbo conversion). Restore them from the
+        // bundled sidecar; keys are in Swift module naming so they merge directly.
+        // Only fills keys the checkpoint doesn't provide, so a future corrected
+        // checkpoint wins automatically.
+        if let sidecarURL = Bundle.module.url(
+            forResource: "chatterbox_s3gen_attn_out_biases", withExtension: "safetensors")
+        {
+            let sidecar = try MLX.loadArrays(url: sidecarURL)
+            var restored = 0
+            for (key, value) in sidecar where sanitizedWeights[key] == nil {
+                sanitizedWeights[key] = value
+                restored += 1
+            }
+            if restored > 0 {
+                print("[Chatterbox] Restored \(restored) attn out-proj biases dropped by the checkpoint conversion")
+            }
+        }
 
         // Quantization
         if config.quantization != nil || config.perLayerQuantization != nil {
@@ -964,6 +991,16 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         }
 
         // Update model parameters — allow unused keys since we drop tokenizer weights
+        if ProcessInfo.processInfo.environment["CHATTERBOX_DEBUG_LOAD"] != nil {
+            let paramKeys = Set(model.parameters().flattened().map(\.0))
+            let weightKeys = Set(sanitizedWeights.keys)
+            let unloaded = paramKeys.subtracting(weightKeys).sorted()
+            let misrouted = weightKeys.subtracting(paramKeys).sorted()
+            print("[LOAD-DEBUG] params with NO checkpoint value (\(unloaded.count)) — these keep random init:")
+            for k in unloaded { print("  UNLOADED \(k)") }
+            print("[LOAD-DEBUG] checkpoint keys matching NO param (\(misrouted.count)) — these are dropped:")
+            for k in misrouted { print("  DROPPED \(k)") }
+        }
         try model.update(parameters: ModuleParameters.unflattened(sanitizedWeights), verify: [])
 
         eval(model)
