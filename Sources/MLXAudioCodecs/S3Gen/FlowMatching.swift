@@ -221,7 +221,9 @@ class S3GenSelfAttention: Module {
     @ModuleInfo(key: "to_k") var toK: Linear
     @ModuleInfo(key: "to_v") var toV: Linear
     /// Python: `self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim)])`
-    /// Weight keys: `to_out.0.{weight,bias}`
+    /// Weight keys: `to_out.0.{weight,bias}`. The Turbo checkpoint ships the bias;
+    /// the Regular (mlx-community_Chatterbox-TTS-fp16) conversion dropped it, so the
+    /// loader restores it from a bundled sidecar (see ChatterboxModel.fromModelDirectory).
     @ModuleInfo(key: "to_out") var toOut: [Linear]
 
     init(dim: Int, numHeads: Int, headDim: Int) {
