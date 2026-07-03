@@ -623,8 +623,9 @@ class HiFTGenerator: Module {
             h = xs! / Float(numKernels)
         }
 
-        // Final processing
-        h = leakyRelu(h, negativeSlope: lreluSlope)
+        // Final processing — Python uses F.leaky_relu(x) with the DEFAULT slope
+        // (0.01) here, unlike the 0.1 lrelu_slope used inside the upsample loop.
+        h = leakyRelu(h, negativeSlope: 0.01)
         h = h.transposed(0, 2, 1)  // (B, T, C)
         h = convPost(h)  // Conv1d in (B, T, C)
         h = h.transposed(0, 2, 1)  // (B, nFft+2, T)
@@ -633,6 +634,15 @@ class HiFTGenerator: Module {
         let nFftHalf = nFft / 2 + 1
         let mag = exp(h[0..., ..<nFftHalf, 0...])
         let phase = MLX.sin(h[0..., nFftHalf..., 0...])
+
+        // Debug hook: CHATTERBOX_DUMP_MAGPHASE=path — pre-ISTFT spectra.
+        if let p = ProcessInfo.processInfo.environment["CHATTERBOX_DUMP_MAGPHASE"] {
+            eval(mag, phase)
+            try? MLX.save(
+                arrays: ["mag": mag.asType(.float32), "phase": phase.asType(.float32)],
+                url: URL(fileURLWithPath: p))
+            print("[HiFT-DEBUG] dumped mag \(mag.shape) phase \(phase.shape)")
+        }
 
         // Inverse STFT
         var output = hifigan_istft(
@@ -665,8 +675,30 @@ class HiFTGenerator: Module {
             s = MLX.concatenated([cache, s[0..., 0..., cacheLen...]], axis: 2)
         }
 
+        // Debug hook: CHATTERBOX_SOURCE_FILE=path — substitute the harmonic source
+        // signal (key "source") so decode can be compared deterministically.
+        if let sp = ProcessInfo.processInfo.environment["CHATTERBOX_SOURCE_FILE"],
+           let injected = try? MLX.loadArrays(url: URL(fileURLWithPath: sp))["source"]
+        {
+            s = injected
+            print("[HiFT-DEBUG] substituted source \(s.shape) from \(sp)")
+        }
+
         // Decode
         let generatedSpeech = decode(x: speechFeat, s: s)
+
+        // Debug hook: CHATTERBOX_DUMP_HIFT=path — save vocoder intermediates.
+        if let p = ProcessInfo.processInfo.environment["CHATTERBOX_DUMP_HIFT"] {
+            eval(f0, s, generatedSpeech)
+            try? MLX.save(
+                arrays: [
+                    "f0": f0.asType(.float32),
+                    "source": s.asType(.float32),
+                    "wav": generatedSpeech.asType(.float32),
+                ],
+                url: URL(fileURLWithPath: p))
+            print("[HiFT-DEBUG] dumped f0 \(f0.shape), source \(s.shape), wav \(generatedSpeech.shape)")
+        }
 
         return (generatedSpeech, s)
     }

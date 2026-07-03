@@ -183,31 +183,38 @@ public func stft(
     window: MLXArray,
     nFft: Int,
     hopLength: Int,
-    padMode: PadMode = .reflect
+    padMode: PadMode = .reflect,
+    center: Bool = true
 ) -> MLXArray {
-    // Pad audio for centering
-    let padding = nFft / 2
+    // Pad audio for centering (center=false when the caller pads itself,
+    // e.g. the s3gen mel's torch-style (nFft-hop)/2 reflect padding —
+    // double-padding shifted the mel by 2 frames vs the reference).
+    let padding = center ? nFft / 2 : 0
     let audioLen = audio.shape[0]
 
     let padded: MLXArray
-    switch padMode {
-    case .reflect:
-        // Reflect padding: reverse slices at both ends
-        let prefixSlice = audio[1..<(min(padding + 1, audioLen))]
-        let prefix = reverseArray(prefixSlice)
+    if padding == 0 {
+        padded = audio
+    } else {
+        switch padMode {
+        case .reflect:
+            // Reflect padding: reverse slices at both ends
+            let prefixSlice = audio[1..<(min(padding + 1, audioLen))]
+            let prefix = reverseArray(prefixSlice)
 
-        let suffixStart = max(0, audioLen - padding - 1)
-        let suffixEnd = max(1, audioLen - 1)
-        let suffixSlice = audio[suffixStart..<suffixEnd]
-        let suffix = reverseArray(suffixSlice)
+            let suffixStart = max(0, audioLen - padding - 1)
+            let suffixEnd = max(1, audioLen - 1)
+            let suffixSlice = audio[suffixStart..<suffixEnd]
+            let suffix = reverseArray(suffixSlice)
 
-        padded = MLX.concatenated([prefix, audio, suffix])
+            padded = MLX.concatenated([prefix, audio, suffix])
 
-    case .constant:
-        // Zero padding
-        let prefix = MLXArray.zeros([padding])
-        let suffix = MLXArray.zeros([padding])
-        padded = MLX.concatenated([prefix, audio, suffix])
+        case .constant:
+            // Zero padding
+            let prefix = MLXArray.zeros([padding])
+            let suffix = MLXArray.zeros([padding])
+            padded = MLX.concatenated([prefix, audio, suffix])
+        }
     }
 
     // Calculate number of frames

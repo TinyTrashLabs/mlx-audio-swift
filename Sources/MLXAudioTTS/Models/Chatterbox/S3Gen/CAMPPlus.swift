@@ -657,32 +657,46 @@ class CAMPPlus: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let probe = ProcessInfo.processInfo.environment["CHATTERBOX_DEBUG_COND"] != nil
+        func stat(_ label: String, _ a: MLXArray) {
+            guard probe else { return }
+            eval(a)
+            print("[CAMPP-DEBUG] \(label): shape \(a.shape) absMax \(MLX.abs(a).max().item(Float.self)) mean \(a.mean().item(Float.self))")
+        }
+
         // x: (B, T, F) fbank features
         var out = x.transposed(0, 2, 1) // (B, F, T)
+        stat("input", out)
 
         // FCM head
         out = head(out) // (B, 320, T)
+        stat("head", out)
 
         // TDNN
         out = tdnn(out) // (B, 128, T/2)
+        stat("tdnn", out)
 
         // Dense blocks + transits
-        for (block, transit) in zip(blocks, transits) {
+        for (i, (block, transit)) in zip(blocks, transits).enumerated() {
             out = block(out)
+            stat("block\(i)", out)
             out = transit(out)
+            stat("transit\(i)", out)
         }
 
         // Output nonlinear
         for layer in outNonlinear {
-            if let bn = layer as? BatchNorm { out = batchNormBCT(bn, out) }
-            else if let r = layer as? ReLUModule { out = r(out) }
+            if let bn = layer as? BatchNorm { out = batchNormBCT(bn, out); stat("outBN", out) }
+            else if let r = layer as? ReLUModule { out = r(out); stat("outReLU", out) }
         }
 
         // Stats pooling: (B, C, T) -> (B, 2*C)
         out = pool(out)
+        stat("pool", out)
 
         // Dense: (B, 2*C) -> (B, embedDim)
         out = dense(out)
+        stat("dense", out)
 
         return out // (B, 192)
     }
@@ -695,6 +709,15 @@ class CAMPPlus: Module {
         for wav in wavs {
             let fbank = kaldiFbank(audio: wav, sampleRate: sampleRate)
             feats.append(fbank) // (T, 80)
+        }
+
+        // Debug hook: CHATTERBOX_DUMP_FBANK=path — save audio + fbank for parity checks.
+        if let p = ProcessInfo.processInfo.environment["CHATTERBOX_DUMP_FBANK"], let f = feats.first {
+            eval(f)
+            try? MLX.save(
+                arrays: ["audio": wavs[0].asType(.float32), "fbank": f.asType(.float32)],
+                url: URL(fileURLWithPath: p))
+            print("[CAMPP-DEBUG] dumped fbank \(f.shape) to \(p)")
         }
 
         // Mean normalization per utterance

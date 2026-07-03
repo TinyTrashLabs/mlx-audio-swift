@@ -27,9 +27,10 @@ public struct S3TokenizerConfig {
 /// Precompute rotary position embeddings (cos, sin) for the attention blocks.
 private func precomputeFreqsCis(dim: Int, end: Int, theta: Float = 10000.0) -> (MLXArray, MLXArray) {
     let halfDim = dim / 2
+    // Python: arange(0, dim, 2) / dim — exponents step by 2/dim, NOT 1/dim.
     let freqs = 1.0 / MLX.pow(
         MLXArray(theta),
-        MLXArray(0 ..< halfDim).asType(.float32)[..<halfDim] / Float(dim)
+        MLXArray(0 ..< halfDim).asType(.float32) * (2.0 / Float(dim))
     )
     let t = MLXArray(0 ..< end).asType(.float32)
     let outerProduct = t.expandedDimensions(axis: 1) * freqs.expandedDimensions(axis: 0)
