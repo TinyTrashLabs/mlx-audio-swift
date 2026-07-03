@@ -579,6 +579,20 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             // No eval() here — defer to single eval below
             s3genPromptToken = s3genTokens
 
+            // Debug hook: CHATTERBOX_DUMP_S3TOK=path — save tokenizer input audio,
+            // its 128-mel, and the resulting tokens for cross-impl comparison.
+            if let s3tokDump = ProcessInfo.processInfo.environment["CHATTERBOX_DUMP_S3TOK"] {
+                eval(s3genTokens)
+                try MLX.save(
+                    arrays: [
+                        "audio16k": audio16kFromDec.asType(.float32),
+                        "mel128": s3genMel.asType(.float32),
+                        "tokens": s3genTokens.asType(.int32),
+                    ],
+                    url: URL(fileURLWithPath: s3tokDump))
+                print("[Chatterbox] DEBUG dumped s3tok bundle to \(s3tokDump)")
+            }
+
             print("[Chatterbox]   S3TokenizerV2: T3 tokens \(t3PromptSpeechTokens.shape) (plen=\(plen)), S3Gen tokens \(s3genPromptToken.shape)")
         } else {
             // Fallback: use default conditioning tokens
@@ -595,6 +609,13 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         // --- 3. CAMPPlus: 192-dim x-vector for S3Gen flow decoder ---
         let xVector = s3gen.speakerEncoder.inference([audio16kFromDec])
         // No eval() here — defer to single eval below
+        if ProcessInfo.processInfo.environment["CHATTERBOX_DEBUG_COND"] != nil {
+            eval(xVector)
+            let aMax = MLX.abs(audio16kFromDec).max().item(Float.self)
+            let xMax = MLX.abs(xVector).max().item(Float.self)
+            print("[COND-DEBUG] audio16kFromDec: shape \(audio16kFromDec.shape) absMax \(aMax)")
+            print("[COND-DEBUG] xVector: absMax \(xMax)")
+        }
 
         // --- 4. S3Gen prompt mel features ---
         let s3genPromptFeat = s3genMelSpectrogram(
@@ -634,6 +655,19 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
                 }
             }
             print("[Chatterbox]   Aligned: promptToken \(promptToken.shape), promptFeat \(promptFeat.shape)")
+        }
+
+        // Debug hook: CHATTERBOX_DUMP_COND=path — save S3Gen conditioning tensors
+        // for cross-implementation comparison (all deterministic given ref audio).
+        if let condDump = ProcessInfo.processInfo.environment["CHATTERBOX_DUMP_COND"] {
+            try MLX.save(
+                arrays: [
+                    "prompt_token": promptToken.asType(.int32),
+                    "prompt_feat": promptFeat.asType(.float32),
+                    "embedding": xVector.asType(.float32),
+                ],
+                url: URL(fileURLWithPath: condDump))
+            print("[Chatterbox] DEBUG dumped conditioning to \(condDump)")
         }
 
         // Build T3Cond
@@ -782,7 +816,26 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         print("[Chatterbox] Stage 1 complete: \(speechTokens.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t3Start))s")
 
         // Post-process: remove OOV tokens and append silence
-        let cleanTokens = dropInvalidTokens(speechTokens)
+        var cleanTokens = dropInvalidTokens(speechTokens)
+
+        // Debug hooks for cross-implementation stage isolation:
+        // CHATTERBOX_DUMP_TOKENS=path — write the clean token ids as JSON.
+        // CHATTERBOX_TOKENS_FILE=path — replace T3's tokens with ids from JSON,
+        // so S3Gen renders another implementation's token sequence.
+        let env = ProcessInfo.processInfo.environment
+        if let dumpPath = env["CHATTERBOX_DUMP_TOKENS"] {
+            let ids = cleanTokens.asArray(Int32.self)
+            let data = try JSONSerialization.data(withJSONObject: ids.map(Int.init))
+            try data.write(to: URL(fileURLWithPath: dumpPath))
+            print("[Chatterbox] DEBUG dumped \(ids.count) tokens to \(dumpPath)")
+        }
+        if let tokensPath = env["CHATTERBOX_TOKENS_FILE"] {
+            let data = try Data(contentsOf: URL(fileURLWithPath: tokensPath))
+            let ids = (try JSONSerialization.jsonObject(with: data) as! [Int]).map(Int32.init)
+            cleanTokens = MLXArray(ids)
+            print("[Chatterbox] DEBUG substituted \(ids.count) tokens from \(tokensPath)")
+        }
+
         // Append 3 silence tokens (S3GEN_SIL = 4299) to reduce artifacts at end
         let silenceTokens = MLXArray([Int32(4299), Int32(4299), Int32(4299)])
         let finalTokens = MLX.concatenated([cleanTokens, silenceTokens])
@@ -804,10 +857,11 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         }
 
         // Run flow matching inference with raw int32 token IDs
-        // Meanflow (turbo distilled): 2 steps. Non-meanflow (regular): 10 steps.
-        // gloam experiment: raise ODE steps to test whether rough/"choppy"
-        // chatterbox output is an under-resolved vocoder mel. Was 2 : 10.
-        let nTimesteps = config.meanflow ? 8 : 32
+        // Meanflow (turbo distilled): raised to 8 (gloam experiment, shipped).
+        // Non-meanflow (regular): 10, matching the PyTorch reference. An
+        // earlier experiment raised this to 32, but it predated the restored
+        // attn biases and was never re-validated against the reference.
+        let nTimesteps = config.meanflow ? 8 : 10
         print("[Chatterbox] Stage 2: S3Gen speech tokens→mel (nTimesteps=\(nTimesteps), tokens=\(tokenArr.shape))")
         let s3Start = CFAbsoluteTimeGetCurrent()
         let mel = s3gen.inference(
@@ -823,10 +877,23 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         eval(mel)
         print("[Chatterbox] Stage 2 complete: mel \(mel.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - s3Start))s")
 
+        // Debug hooks for stage isolation (see token hooks above):
+        // CHATTERBOX_DUMP_MEL=path — save the flow-matching mel as safetensors.
+        // CHATTERBOX_MEL_FILE=path — vocode a mel produced elsewhere instead.
+        var melForVocoder = mel
+        if let melDump = env["CHATTERBOX_DUMP_MEL"] {
+            try MLX.save(arrays: ["mel": mel.asType(.float32)], url: URL(fileURLWithPath: melDump))
+            print("[Chatterbox] DEBUG dumped mel \(mel.shape) to \(melDump)")
+        }
+        if let melPath = env["CHATTERBOX_MEL_FILE"] {
+            melForVocoder = try MLX.loadArrays(url: URL(fileURLWithPath: melPath))["mel"]!
+            print("[Chatterbox] DEBUG substituted mel \(melForVocoder.shape) from \(melPath)")
+        }
+
         print("[Chatterbox] Stage 3: Vocoder mel→waveform")
         let vocStart = CFAbsoluteTimeGetCurrent()
         // Vocoder: mel → waveform via HiFi-GAN
-        var (waveform, _) = s3gen.vocoder(mel)
+        var (waveform, _) = s3gen.vocoder(melForVocoder)
         try Task.checkCancellation()
 
         // Apply fade-in window to reduce vocoder spillover artifacts at start (matches Python trim_fade)
@@ -954,8 +1021,21 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         // Load main weights
         let weights = try loadChatterboxWeights(modelDir: modelDir)
 
+        // Debug hook: CHATTERBOX_S3GEN_WEIGHTS=path — overlay checkpoint-naming
+        // weights (e.g. fp32 originals) over the loaded checkpoint before sanitize.
+        var effectiveWeights = weights
+        if let wPath = ProcessInfo.processInfo.environment["CHATTERBOX_S3GEN_WEIGHTS"] {
+            let overlay = try MLX.loadArrays(url: URL(fileURLWithPath: wPath))
+            var replaced = 0
+            for (key, value) in overlay where effectiveWeights[key] != nil {
+                effectiveWeights[key] = value
+                replaced += 1
+            }
+            print("[Chatterbox] DEBUG overlaid \(replaced)/\(overlay.count) weights from \(wPath)")
+        }
+
         // Sanitize weights
-        var sanitizedWeights = model.sanitize(weights: weights)
+        var sanitizedWeights = model.sanitize(weights: effectiveWeights)
 
         // The mlx-community Regular conversion dropped the flow estimator's 56
         // trained `attn1.to_out.0.bias` vectors (present in the original ResembleAI
@@ -975,6 +1055,18 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             if restored > 0 {
                 print("[Chatterbox] Restored \(restored) attn out-proj biases dropped by the checkpoint conversion")
             }
+        }
+
+        // CHATTERBOX_FP32=1: cast all weights to float32 so compute runs in fp32
+        // like the PyTorch reference (checkpoints store fp16; MLX computes in the
+        // weights' dtype). Diagnostic knob for precision-parity testing.
+        if ProcessInfo.processInfo.environment["CHATTERBOX_FP32"] != nil,
+           config.quantization == nil, config.perLayerQuantization == nil
+        {
+            for (key, value) in sanitizedWeights where value.dtype == .float16 {
+                sanitizedWeights[key] = value.asType(.float32)
+            }
+            print("[Chatterbox] CHATTERBOX_FP32: cast fp16 weights to float32")
         }
 
         // Quantization
@@ -1002,6 +1094,13 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             for k in misrouted { print("  DROPPED \(k)") }
         }
         try model.update(parameters: ModuleParameters.unflattened(sanitizedWeights), verify: [])
+
+        // Inference mode (matches Python model.eval(), and Kokoro/KittenTTS here).
+        // MLX modules default to training=true: BatchNorm then normalizes with
+        // per-batch statistics instead of the loaded running stats (CAMPPlus'
+        // final BN sees a single pooled value per channel → exact-zero x-vector)
+        // and Dropout randomly zeroes activations during generation.
+        model.train(false)
 
         eval(model)
 
@@ -1141,90 +1240,14 @@ private func loadChatterboxWeights(modelDir: URL) throws -> [String: MLXArray] {
 /// Audio samples are bulk-extracted via `asArray()` for fast CPU-side computation.
 private func resampleAudio(_ audio: MLXArray, fromSR: Int, toSR: Int) -> MLXArray {
     guard fromSR != toSR else { return audio }
-
-    func gcd(_ a: Int, _ b: Int) -> Int {
-        var a = a, b = b
-        while b != 0 { (a, b) = (b, a % b) }
-        return a
-    }
-
-    let g = gcd(fromSR, toSR)
-    let up = toSR / g
-    let down = fromSR / g
-
-    let inputLength = audio.dim(0)
-    let outputLength = (inputLength * up + down - 1) / down
-
-    // Design lowpass FIR filter: windowed sinc with Kaiser window
-    let nZeroCrossings = 10
-    let filterHalfLen = nZeroCrossings * max(up, down)
-    let filterLen = 2 * filterHalfLen + 1
-
-    // Cutoff frequency: min(1/up, 1/down) to prevent aliasing
-    let fc = 1.0 / Float(max(up, down))
-
-    var h = [Float](repeating: 0, count: filterLen)
-    let beta: Float = 5.0
-    let i0Beta = besselI0(beta)
-    for i in 0 ..< filterLen {
-        let n = Float(i - filterHalfLen)
-        // Sinc
-        let sincVal: Float = (n == 0) ? fc : fc * sin(Float.pi * fc * n) / (Float.pi * fc * n)
-        // Kaiser window
-        let x = 2.0 * Float(i) / Float(filterLen - 1) - 1.0
-        let arg = beta * sqrt(max(0, 1.0 - x * x))
-        h[i] = sincVal * besselI0(arg) / i0Beta
-    }
-
-    // Normalize filter so that passband gain = up
-    let filterSum = h.reduce(0, +)
-    let normFactor = Float(up) / filterSum
-    for i in 0 ..< filterLen { h[i] *= normFactor }
-
-    // Decompose filter into polyphase components: phase p has taps at indices p, p+up, p+2*up, ...
-    // For each output sample i: phase = (i * down) % up
-    // The convolution sum becomes a dot product of the phase's taps with input samples.
-    let tapsPerPhase = (filterLen + up - 1) / up
-    var polyphase = [[Float]](repeating: [Float](repeating: 0, count: tapsPerPhase), count: up)
-    for p in 0 ..< up {
-        var t = 0
-        var idx = p
-        while idx < filterLen {
-            polyphase[p][t] = h[idx]
-            t += 1
-            idx += up
-        }
-    }
-
-    // Bulk-extract audio samples (single memcpy, not per-element)
-    let flatAudio = audio.reshaped([-1]).asType(.float32)
-    eval(flatAudio)
-    let audioSamples = flatAudio.asArray(Float.self)
-
-    // Polyphase resampling: for each output sample, pick the right phase and dot-product
-    var output = [Float](repeating: 0, count: outputLength)
-    for i in 0 ..< outputLength {
-        let n = i * down  // Position in upsampled signal
-        let phase = n % up
-        let taps = polyphase[phase]
-
-        // First input sample that contributes: ceil((n - filterHalfLen) / up)
-        // But also the polyphase offset: startOrig = (n - phase) / up - (filterHalfLen - phase) / up
-        // Simplified: the k-th tap of this phase corresponds to input index (n / up) - k + correction
-        let baseOrig = (n - phase) / up  // Input index for tap 0 (before centering)
-        let centerOffset = filterHalfLen / up  // Centering shift
-
-        var sum: Float = 0
-        for t in 0 ..< tapsPerPhase {
-            let origIdx = baseOrig - centerOffset + t
-            if origIdx >= 0 && origIdx < inputLength {
-                sum += audioSamples[origIdx] * taps[t]
-            }
-        }
-        output[i] = sum
-    }
-
-    return MLXArray(output)
+    // Chatterbox conditioning (24k prompt mel features, 16k x-vector + tokenizer)
+    // must match the PyTorch reference so the CAMPPlus speaker x-vector agrees.
+    // The previous Kaiser resampler cut at Nyquist (rolloff 1.0) and left ~+14 dB
+    // of excess 7–8 kHz energy vs torchaudio's Resample, corrupting the x-vector
+    // (cos ~0.64 to the reference) and making regular Chatterbox output audibly
+    // brighter/edgier. `sincResampleAudio` matches torchaudio exactly (Hann window,
+    // width 6, rolloff 0.99).
+    return sincResampleAudio(audio.reshaped([-1]), from: fromSR, to: toSR)
 }
 
 /// Modified Bessel function of the first kind, order 0.

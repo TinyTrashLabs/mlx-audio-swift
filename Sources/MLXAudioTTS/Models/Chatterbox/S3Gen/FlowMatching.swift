@@ -575,6 +575,7 @@ class S3GenConditionalDecoder: Module {
             inputs.append(cond)
         }
         var h = MLX.concatenated(inputs, axis: 1)
+        let dbgHInput = h
 
         // 3. Down path
         var hiddens: [MLXArray] = []
@@ -589,12 +590,15 @@ class S3GenConditionalDecoder: Module {
             masks.append(maskDown.take(strideIndices, axis: 2))
         }
         masks.removeLast()  // Remove the last (smallest) mask
+        let dbgHDown = h
+        let dbgSkip0 = hiddens.first ?? h
 
         // 4. Mid path
         let maskMid = masks.last!
         for midBlock in midBlocks {
             h = midBlock(h, mask: maskMid, timeEmb: tEmb)
         }
+        let dbgHMid = h
 
         // 5. Up path
         for upBlock in upBlocks {
@@ -602,12 +606,33 @@ class S3GenConditionalDecoder: Module {
             let skip = hiddens.removeLast()
             h = upBlock(h, skip: skip, mask: maskUp, timeEmb: tEmb)
         }
+        let dbgHUp = h
 
         // 6. Final block + projection
         let finalMask = mask
         h = finalBlock(h, mask: finalMask)
+        let dbgHFinal = h
 
         let output = finalProj(h * finalMask)
+
+        // Debug hook: CHATTERBOX_DUMP_UNET=path — dump per-stage activations of the
+        // first estimator call so the reference estimator can be traced stage-by-stage
+        // to localize the forward divergence. Writes once (skips if file exists).
+        if let p = ProcessInfo.processInfo.environment["CHATTERBOX_DUMP_UNET"],
+           !FileManager.default.fileExists(atPath: p) {
+            try? MLX.save(
+                arrays: [
+                    "temb": tEmb.asType(.float32),
+                    "h_input": dbgHInput.asType(.float32),
+                    "h_down": dbgHDown.asType(.float32),
+                    "skip0": dbgSkip0.asType(.float32),
+                    "h_mid": dbgHMid.asType(.float32),
+                    "h_up": dbgHUp.asType(.float32),
+                    "h_final": dbgHFinal.asType(.float32),
+                    "out": (output * finalMask).asType(.float32),
+                ],
+                url: URL(fileURLWithPath: p))
+        }
         return output * finalMask
     }
 }
@@ -630,11 +655,6 @@ class CausalConditionalCFM: Module {
     let tScheduler: String
     let nFeats: Int
 
-    /// Pre-generated deterministic noise for Regular (non-meanflow) models.
-    /// Python: `mx.random.seed(0); self.rand_noise = mx.random.normal((1, 80, 50*300))`
-    /// Using fixed seed ensures reproducible inference. Turbo uses fresh random noise instead.
-    let randNoise: MLXArray?
-
     @ModuleInfo(key: "estimator") var estimator: S3GenConditionalDecoder
 
     init(
@@ -651,30 +671,6 @@ class CausalConditionalCFM: Module {
         self.tScheduler = tScheduler
         self.meanflow = meanflow
         self.nFeats = outChannels
-
-        // Regular (non-meanflow) model uses deterministic noise from a fixed seed.
-        // This matches Python's CausalConditionalCFM.__init__ which does:
-        //   mx.random.seed(0)
-        //   self.rand_noise = mx.random.normal((1, MEL_CHANNELS, 50 * 300))
-        //
-        // IMPORTANT: We must use seed-based (state) generation, NOT key-based.
-        // mx.random.seed(0) followed by mx.random.normal() (no explicit key) internally
-        // splits the state's key before generating, producing different values than
-        // mx.random.normal(key=mx.random.key(0)). Using the wrong method gives
-        // completely different starting noise for the ODE solver.
-        //
-        // A task-local RandomState reproduces those exact values WITHOUT reseeding
-        // the process-global RNG — `MLXRandom.seed(0)` here would silently make all
-        // downstream sampling (e.g. T3 token sampling) deterministic per process.
-        if !meanflow {
-            let noiseState = MLXRandom.RandomState(seed: 0)
-            self.randNoise = withRandomState(noiseState) {
-                MLXRandom.normal([1, Self.melChannels, 50 * 300])
-            }
-            eval(self.randNoise!)
-        } else {
-            self.randNoise = nil
-        }
 
         self._estimator.wrappedValue = S3GenConditionalDecoder(
             inChannels: inChannels, outChannels: outChannels,
@@ -798,11 +794,12 @@ class CausalConditionalCFM: Module {
             }
             z = noise
         } else {
-            // Regular: deterministic noise from pre-generated buffer (seed=0).
-            // Python: `z = self.rand_noise[:, :, :T] * temperature`
-            // Temperature is always 1.0 for CausalConditionalCFM.
-            let T = mu.dim(2)
-            z = randNoise![0..., 0..., ..<T]
+            // Regular: match the ResembleAI reference, which draws FRESH noise every
+            // call (`z = torch.randn_like(mu)`, with `self.rand_noise = None`). The
+            // mlx-audio port instead froze a seed-0 buffer, stamping one draw's
+            // spectral idiosyncrasy on every output (and every take). Fresh noise
+            // both matches the reference and restores natural take-to-take variation.
+            z = MLXRandom.normal(mu.shape)
         }
 
         // Time schedule: cosine for Regular, linear for Turbo (meanflow)
@@ -813,6 +810,24 @@ class CausalConditionalCFM: Module {
             tSpan = 1.0 - MLX.cos(linear * Float32(Float.pi / 2))
         } else {
             tSpan = linear
+        }
+
+        // Debug hook: CHATTERBOX_DUMP_CFMIN=path — dump the complete estimator
+        // input set (mu, mask, spks, cond, z) so the reference solve_euler can be
+        // run on IDENTICAL inputs, isolating the estimator forward from the
+        // upstream conditioning (encoder mu / x-vector / prompt-feat).
+        if let dumpPath = ProcessInfo.processInfo.environment["CHATTERBOX_DUMP_CFMIN"] {
+            try? MLX.save(
+                arrays: [
+                    "mu": mu.asType(.float32),
+                    "mask": mask.asType(.float32),
+                    "spks": (spks ?? MLXArray.zeros([1, nFeats])).asType(.float32),
+                    "cond": (cond ?? MLXArray.zeros([1, nFeats, mu.dim(2)])).asType(.float32),
+                    "z": z.asType(.float32),
+                    "t_span": tSpan.asType(.float32),
+                ],
+                url: URL(fileURLWithPath: dumpPath))
+            print("[Chatterbox] DEBUG dumped CFM inputs to \(dumpPath)")
         }
 
         // Meanflow (Turbo): basic Euler without CFG, passes r to estimator
