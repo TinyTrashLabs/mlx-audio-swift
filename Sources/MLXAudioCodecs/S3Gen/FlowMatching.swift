@@ -630,11 +630,6 @@ class CausalConditionalCFM: Module {
     let tScheduler: String
     let nFeats: Int
 
-    /// Pre-generated deterministic noise for Regular (non-meanflow) models.
-    /// Python: `mx.random.seed(0); self.rand_noise = mx.random.normal((1, 80, 50*300))`
-    /// Using fixed seed ensures reproducible inference. Turbo uses fresh random noise instead.
-    let randNoise: MLXArray?
-
     @ModuleInfo(key: "estimator") var estimator: S3GenConditionalDecoder
 
     init(
@@ -651,24 +646,6 @@ class CausalConditionalCFM: Module {
         self.tScheduler = tScheduler
         self.meanflow = meanflow
         self.nFeats = outChannels
-
-        // Regular (non-meanflow) model uses deterministic noise from a fixed seed.
-        // This matches Python's CausalConditionalCFM.__init__ which does:
-        //   mx.random.seed(0)
-        //   self.rand_noise = mx.random.normal((1, MEL_CHANNELS, 50 * 300))
-        //
-        // IMPORTANT: We must use seed-based (global state) generation, NOT key-based.
-        // mx.random.seed(0) followed by mx.random.normal() (no explicit key) internally
-        // splits the global key before generating, producing different values than
-        // mx.random.normal(key=mx.random.key(0)). Using the wrong method gives
-        // completely different starting noise for the ODE solver.
-        if !meanflow {
-            MLXRandom.seed(0)
-            self.randNoise = MLXRandom.normal([1, Self.melChannels, 50 * 300])
-            eval(self.randNoise!)
-        } else {
-            self.randNoise = nil
-        }
 
         self._estimator.wrappedValue = S3GenConditionalDecoder(
             inChannels: inChannels, outChannels: outChannels,
@@ -792,11 +769,12 @@ class CausalConditionalCFM: Module {
             }
             z = noise
         } else {
-            // Regular: deterministic noise from pre-generated buffer (seed=0).
-            // Python: `z = self.rand_noise[:, :, :T] * temperature`
-            // Temperature is always 1.0 for CausalConditionalCFM.
-            let T = mu.dim(2)
-            z = randNoise![0..., 0..., ..<T]
+            // Regular: match the ResembleAI reference, which draws FRESH noise every
+            // call (`z = torch.randn_like(mu)`, with `self.rand_noise = None`). The
+            // mlx-audio port instead froze a seed-0 buffer, stamping one draw's
+            // spectral idiosyncrasy on every output (and every take). Fresh noise
+            // matches the reference and restores natural take-to-take variation.
+            z = MLXRandom.normal(mu.shape)
         }
 
         // Time schedule: cosine for Regular, linear for Turbo (meanflow)

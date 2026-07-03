@@ -1002,6 +1002,13 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         }
         try model.update(parameters: ModuleParameters.unflattened(sanitizedWeights), verify: [])
 
+        // Inference mode (matches PyTorch's model.eval(), like Kokoro/KittenTTS here).
+        // MLX modules default to training=true: without this, BatchNorm normalizes with
+        // per-batch statistics instead of the loaded running stats (CAMPPlus' final BN
+        // sees a single pooled value per channel → an exact-zero speaker x-vector) and
+        // Dropout randomly zeroes activations during generation.
+        model.train(false)
+
         eval(model)
 
         // Ensure tokenizer files exist before loading
@@ -1125,90 +1132,14 @@ private func loadChatterboxWeights(modelDir: URL) throws -> [String: MLXArray] {
 /// Audio samples are bulk-extracted via `asArray()` for fast CPU-side computation.
 private func resampleAudio(_ audio: MLXArray, fromSR: Int, toSR: Int) -> MLXArray {
     guard fromSR != toSR else { return audio }
-
-    func gcd(_ a: Int, _ b: Int) -> Int {
-        var a = a, b = b
-        while b != 0 { (a, b) = (b, a % b) }
-        return a
-    }
-
-    let g = gcd(fromSR, toSR)
-    let up = toSR / g
-    let down = fromSR / g
-
-    let inputLength = audio.dim(0)
-    let outputLength = (inputLength * up + down - 1) / down
-
-    // Design lowpass FIR filter: windowed sinc with Kaiser window
-    let nZeroCrossings = 10
-    let filterHalfLen = nZeroCrossings * max(up, down)
-    let filterLen = 2 * filterHalfLen + 1
-
-    // Cutoff frequency: min(1/up, 1/down) to prevent aliasing
-    let fc = 1.0 / Float(max(up, down))
-
-    var h = [Float](repeating: 0, count: filterLen)
-    let beta: Float = 5.0
-    let i0Beta = besselI0(beta)
-    for i in 0 ..< filterLen {
-        let n = Float(i - filterHalfLen)
-        // Sinc
-        let sincVal: Float = (n == 0) ? fc : fc * sin(Float.pi * fc * n) / (Float.pi * fc * n)
-        // Kaiser window
-        let x = 2.0 * Float(i) / Float(filterLen - 1) - 1.0
-        let arg = beta * sqrt(max(0, 1.0 - x * x))
-        h[i] = sincVal * besselI0(arg) / i0Beta
-    }
-
-    // Normalize filter so that passband gain = up
-    let filterSum = h.reduce(0, +)
-    let normFactor = Float(up) / filterSum
-    for i in 0 ..< filterLen { h[i] *= normFactor }
-
-    // Decompose filter into polyphase components: phase p has taps at indices p, p+up, p+2*up, ...
-    // For each output sample i: phase = (i * down) % up
-    // The convolution sum becomes a dot product of the phase's taps with input samples.
-    let tapsPerPhase = (filterLen + up - 1) / up
-    var polyphase = [[Float]](repeating: [Float](repeating: 0, count: tapsPerPhase), count: up)
-    for p in 0 ..< up {
-        var t = 0
-        var idx = p
-        while idx < filterLen {
-            polyphase[p][t] = h[idx]
-            t += 1
-            idx += up
-        }
-    }
-
-    // Bulk-extract audio samples (single memcpy, not per-element)
-    let flatAudio = audio.reshaped([-1]).asType(.float32)
-    eval(flatAudio)
-    let audioSamples = flatAudio.asArray(Float.self)
-
-    // Polyphase resampling: for each output sample, pick the right phase and dot-product
-    var output = [Float](repeating: 0, count: outputLength)
-    for i in 0 ..< outputLength {
-        let n = i * down  // Position in upsampled signal
-        let phase = n % up
-        let taps = polyphase[phase]
-
-        // First input sample that contributes: ceil((n - filterHalfLen) / up)
-        // But also the polyphase offset: startOrig = (n - phase) / up - (filterHalfLen - phase) / up
-        // Simplified: the k-th tap of this phase corresponds to input index (n / up) - k + correction
-        let baseOrig = (n - phase) / up  // Input index for tap 0 (before centering)
-        let centerOffset = filterHalfLen / up  // Centering shift
-
-        var sum: Float = 0
-        for t in 0 ..< tapsPerPhase {
-            let origIdx = baseOrig - centerOffset + t
-            if origIdx >= 0 && origIdx < inputLength {
-                sum += audioSamples[origIdx] * taps[t]
-            }
-        }
-        output[i] = sum
-    }
-
-    return MLXArray(output)
+    // Chatterbox conditioning (24k prompt mel features, 16k x-vector + tokenizer)
+    // must match the PyTorch reference so the CAMPPlus speaker x-vector agrees.
+    // The previous Kaiser resampler cut at Nyquist (rolloff 1.0) and left ~+14 dB of
+    // excess 7-8 kHz energy vs torchaudio's Resample, corrupting the x-vector
+    // (cos ~0.64 to the reference) and making regular Chatterbox output audibly
+    // brighter/edgier. `sincResampleAudio` matches torchaudio exactly (Hann window,
+    // width 6, rolloff 0.99).
+    return sincResampleAudio(audio.reshaped([-1]), from: fromSR, to: toSR)
 }
 
 /// Modified Bessel function of the first kind, order 0.
