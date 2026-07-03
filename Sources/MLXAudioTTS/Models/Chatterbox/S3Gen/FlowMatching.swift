@@ -657,14 +657,20 @@ class CausalConditionalCFM: Module {
         //   mx.random.seed(0)
         //   self.rand_noise = mx.random.normal((1, MEL_CHANNELS, 50 * 300))
         //
-        // IMPORTANT: We must use seed-based (global state) generation, NOT key-based.
+        // IMPORTANT: We must use seed-based (state) generation, NOT key-based.
         // mx.random.seed(0) followed by mx.random.normal() (no explicit key) internally
-        // splits the global key before generating, producing different values than
+        // splits the state's key before generating, producing different values than
         // mx.random.normal(key=mx.random.key(0)). Using the wrong method gives
         // completely different starting noise for the ODE solver.
+        //
+        // A task-local RandomState reproduces those exact values WITHOUT reseeding
+        // the process-global RNG — `MLXRandom.seed(0)` here would silently make all
+        // downstream sampling (e.g. T3 token sampling) deterministic per process.
         if !meanflow {
-            MLXRandom.seed(0)
-            self.randNoise = MLXRandom.normal([1, Self.melChannels, 50 * 300])
+            let noiseState = MLXRandom.RandomState(seed: 0)
+            self.randNoise = withRandomState(noiseState) {
+                MLXRandom.normal([1, Self.melChannels, 50 * 300])
+            }
             eval(self.randNoise!)
         } else {
             self.randNoise = nil
