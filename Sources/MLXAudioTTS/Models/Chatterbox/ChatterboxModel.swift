@@ -762,20 +762,19 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         let temperature = generationParameters.temperature
         let topP = generationParameters.topP
 
-        // Cap max tokens: when using reference audio without prompt speech tokens,
-        // the model may not generate EOS reliably, so use a smaller limit.
-        // ~10 speech tokens per text token is a reasonable heuristic.
+        // Cap max tokens to a text-proportional bound. The model does not generate
+        // EOS reliably — and it's *least* reliable at high `exaggeration` (an
+        // expressive DJ line lifted to excited/hype, 2026-07-03), where it runs past
+        // the end of the text and babbles extra words/sentences. Without a bound it
+        // runs to `maxSpeechTokens`, so cap both paths at ~10 speech tokens per text
+        // token. The reference-clip path (prompt speech tokens present) previously
+        // used the full `maxSpeechTokens` with no bound — that was the runaway.
+        // `maxSpeechTokens` stays the hard ceiling for genuinely long inputs.
         let hasPromptTokens = t3Cond.condPromptSpeechTokens != nil
             && (t3Cond.condPromptSpeechTokens?.dim(1) ?? 0) > 0
-        let maxTokens: Int
-        if hasPromptTokens {
-            maxTokens = config.t3Config.maxSpeechTokens
-        } else {
-            // Estimate: ~10 speech tokens per text token, with min 200, max 768
-            let textLen = textTokens.dim(textTokens.ndim - 1)
-            maxTokens = min(768, max(200, textLen * 10))
-            print("[Chatterbox] No prompt speech tokens — capping maxTokens to \(maxTokens) (text length: \(textLen))")
-        }
+        let textLen = textTokens.dim(textTokens.ndim - 1)
+        let maxTokens = min(config.t3Config.maxSpeechTokens, max(200, textLen * 10))
+        print("[Chatterbox] maxTokens=\(maxTokens) (text length: \(textLen), promptTokens: \(hasPromptTokens))")
 
         print("[Chatterbox] Stage 1: T3 text→speech tokens (maxTokens=\(maxTokens))")
         let t3Start = CFAbsoluteTimeGetCurrent()
