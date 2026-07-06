@@ -61,7 +61,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "3.31.3")),
+        // TTL fork (upstream 3.31.4 + Gemma4 VLM kvSharedOnly backbone fix,
+        // tagged 3.31.5). Same URL as the app's own pin so SwiftPM sees ONE
+        // package identity. Point back upstream once ml-explore/mlx-swift-lm#402 ships.
+        .package(url: "https://github.com/TinyTrashLabs/mlx-swift-lm.git", .upToNextMajor(from: "3.31.3")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1"))
     ],
