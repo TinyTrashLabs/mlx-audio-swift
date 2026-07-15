@@ -61,7 +61,15 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "3.31.3")),
+        // Pinned to the commit that merges ml-explore/mlx-swift-lm#390 (Gemma4
+        // VLM kvSharedOnly fix — QAT checkpoints like gemma-4-e2b/e4b fail to
+        // load without it). No tagged release includes it yet (latest is
+        // 3.31.4, predating the 2026-07-10 merge), so pin the exact commit
+        // rather than the floating range, which would silently resolve to a
+        // pre-fix tag. Repin to a real `.upToNextMajor` range once a release
+        // ships past 09deb8c.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git",
+                revision: "09deb8c4e9056fcd76b60718bb50325d1730572b"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1"))
     ],
