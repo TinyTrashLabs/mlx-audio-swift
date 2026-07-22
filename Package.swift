@@ -131,6 +131,9 @@ let package = Package(
                 "Models/Soprano/README.md",
                 "Models/StyleTTS2/KittenTTS/README.md",
                 "Models/StyleTTS2/Kokoro/README.md",
+                "Models/Supertonic/README.md",
+                "Models/Supertonic/LICENSE-SuperTonic",
+                "Models/Supertonic/NOTICE",
             ],
             resources: [
                 .copy("Models/Chatterbox/Resources/chatterbox_s3gen_attn_out_biases.safetensors")
@@ -299,7 +302,8 @@ let package = Package(
             ],
             path: "Tests",
             resources: [
-                .copy("media")
+                .copy("media"),
+                .copy("Fixtures"),
             ]
         ),
     ]

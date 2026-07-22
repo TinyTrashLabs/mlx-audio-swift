@@ -1,0 +1,26 @@
+SuperTonic 3 — attribution notice
+
+This directory contains a native MLX (Swift) reimplementation of the
+SuperTonic 3 text-to-speech model by Supertone Inc.
+
+Model: https://huggingface.co/Supertone/supertonic-3
+Reference implementation: https://github.com/supertone-inc/supertonic
+
+The model weights consumed by this implementation were format-converted from
+the original ONNX exports (fp32, opset 19) in the `onnx/` directory of
+`Supertone/supertonic-3` to MLX safetensors. These are MODIFIED FILES in the
+sense of the license: the numerical values are unchanged, but the container
+format, tensor key names, and Conv weight axis order ([O,I,K] -> [O,K,I])
+differ from the originals. The classifier-free-guidance scale and Euler
+integration step that are baked into the original vector_estimator.onnx graph
+are factored out into runtime code here.
+
+The weights are licensed under the BigScience Open RAIL-M License (see
+LICENSE-SuperTonic in this directory), which includes use-based restrictions
+(Attachment A of the license). Anyone redistributing the converted weights
+must carry the same license, this notice, and the use restrictions forward.
+
+The Swift source code in this directory is an independent reimplementation
+(ported from a Python-MLX reconstruction validated at <=1e-4 against ONNX
+Runtime) and is licensed under this repository's license; the weights remain
+under the Open RAIL-M license above.
