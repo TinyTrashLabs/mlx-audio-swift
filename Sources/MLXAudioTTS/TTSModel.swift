@@ -186,6 +186,13 @@ public enum TTS {
                 pretrained: { try await KittenTTSModel.fromPretrained($0, textProcessor: processor, cache: $1) },
                 local: { modelDir, _ in try await KittenTTSModel.fromModelDirectory(modelDir, textProcessor: processor) }
             )
+        case "supertonic", "supertonic_3":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await SupertonicModel.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try await SupertonicModel.fromModelDirectory(modelDir) }
+            )
         case "kokoro", "kokoro_tts":
             let processor = textProcessor ?? KokoroMultilingualProcessor()
             return try await load(
@@ -298,6 +305,9 @@ public enum TTS {
         }
         if lower.contains("kokoro") {
             return "kokoro"
+        }
+        if lower.contains("supertonic") {
+            return "supertonic"
         }
         return nil
     }

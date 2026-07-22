@@ -21,3 +21,5 @@ scripts/
 .tmp/
 audit-repo/
 /scratchpad
+weights-repo/
+out_swift_*.wav
