@@ -245,8 +245,21 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     private func decodeChunk(_ codes: MLXArray, chunkTokens: Int = 300) -> MLXArray {
         guard let speechTokenizer else { return MLXArray.zeros([1]) }
 
+        // Each vocoder pass is a big back-to-back Metal/memory burst; at end-of-generation
+        // (batch decode, not streaming) these can run large enough, with no gap between them,
+        // to audibly glitch whatever else is playing audio on the Mac at the time. The two
+        // knobs below let that be tuned (smaller chunks, a sleep between passes) without a
+        // code change. Read fresh on every call — cheap, and it lets an A/B test flip them
+        // between generations without relaunching the app.
+        let resolvedChunkTokens = Qwen3DecodePacing.chunkTokens() ?? chunkTokens
+        let paceMs = Qwen3DecodePacing.paceMs()
+        if resolvedChunkTokens != chunkTokens || paceMs > 0 {
+            let chunkCount = Int(ceil(Double(codes.dim(1)) / Double(resolvedChunkTokens)))
+            print("qwen decode pacing: chunkTokens=\(resolvedChunkTokens) paceMs=\(paceMs) (\(chunkCount) chunks)")
+        }
+
         var audioChunks = [MLXArray]()
-        for chunk in speechTokenizer.streamingDecode(codes, chunkTokens: chunkTokens) {
+        for chunk in speechTokenizer.streamingDecode(codes, chunkTokens: resolvedChunkTokens, paceMs: paceMs) {
             audioChunks.append(chunk)
         }
         var audio = concatenated(audioChunks, axis: -1)[0]
@@ -1387,5 +1400,43 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         let jsonData = try JSONSerialization.data(withJSONObject: tokenizerJson, options: [.sortedKeys])
         try jsonData.write(to: outputPath)
+    }
+}
+
+// MARK: - Decode pacing knobs
+
+/// Runtime-tunable overrides for the vocoder decode chunk size and inter-chunk pacing used
+/// by `decodeChunk`/`streamingDecode`. These exist to soften the audio glitch that a run of
+/// huge, unpaced Metal decode passes causes on other apps' audio when this runs on a Mac
+/// alongside music playback. Both default to nil/0, i.e. today's behavior (300-token chunks,
+/// no sleep) — nothing changes unless one of these is explicitly set.
+enum Qwen3DecodePacing {
+    /// Codec tokens per vocoder decode pass. `nil` means "use the caller's default" (300).
+    /// Checked via UserDefaults first (so it can be flipped from within the running app for
+    /// an A/B test), then an env var (for launch-time overrides), then falls through.
+    static func chunkTokens() -> Int? {
+        if let value = UserDefaults.standard.object(forKey: "qwenDecodeChunkTokens") as? Int, value > 0 {
+            return value
+        }
+        if let raw = ProcessInfo.processInfo.environment["MLX_AUDIO_QWEN_DECODE_CHUNK_TOKENS"],
+           let value = Int(raw), value > 0
+        {
+            return value
+        }
+        return nil
+    }
+
+    /// Milliseconds to sleep between vocoder decode passes. 0 means no pacing (today's
+    /// behavior). Same UserDefaults-then-env lookup as `chunkTokens()`.
+    static func paceMs() -> Int {
+        if let value = UserDefaults.standard.object(forKey: "qwenDecodePaceMs") as? Int, value > 0 {
+            return value
+        }
+        if let raw = ProcessInfo.processInfo.environment["MLX_AUDIO_QWEN_DECODE_PACE_MS"],
+           let value = Int(raw), value > 0
+        {
+            return value
+        }
+        return 0
     }
 }
