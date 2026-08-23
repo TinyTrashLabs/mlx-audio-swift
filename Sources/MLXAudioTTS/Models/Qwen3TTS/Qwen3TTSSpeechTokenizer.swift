@@ -1067,7 +1067,7 @@ final class Qwen3TTSSpeechTokenizer: Module {
         return (wav, audioLengths)
     }
 
-    func streamingDecode(_ audioCodes: MLXArray, chunkTokens: Int = 100) -> [MLXArray] {
+    func streamingDecode(_ audioCodes: MLXArray, chunkTokens: Int = 100, paceMs: Int = 0) -> [MLXArray] {
         let codes = audioCodes.transposed(0, 2, 1)
         let totalTokens = codes.dim(-1)
         var chunks = [MLXArray]()
@@ -1084,6 +1084,12 @@ final class Qwen3TTSSpeechTokenizer: Module {
             chunks.append(wavChunk)
             Memory.clearCache()
             startIndex = endIndex
+            // Give the audio IO thread scheduling room between decode passes — each pass is
+            // a big unbroken Metal/memory burst that can otherwise glitch co-resident audio
+            // playback. Skip the sleep after the last chunk; there's nothing left to protect.
+            if paceMs > 0, startIndex < totalTokens {
+                usleep(UInt32(paceMs) * 1000)
+            }
         }
 
         decoder.resetStreamingState()
