@@ -247,13 +247,17 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         // Each vocoder pass is a big back-to-back Metal/memory burst; at end-of-generation
         // (batch decode, not streaming) these can run large enough, with no gap between them,
-        // to audibly glitch whatever else is playing audio on the Mac at the time. The two
-        // knobs below let that be tuned (smaller chunks, a sleep between passes) without a
-        // code change. Read fresh on every call — cheap, and it lets an A/B test flip them
-        // between generations without relaunching the app.
-        let resolvedChunkTokens = Qwen3DecodePacing.chunkTokens() ?? chunkTokens
-        let paceMs = Qwen3DecodePacing.paceMs()
-        if resolvedChunkTokens != chunkTokens || paceMs > 0 {
+        // to audibly glitch whatever else is playing audio on the Mac at the time. Confirmed
+        // by a 2026-08-23 A/B: 3/3 clean runs at 50-token (~4s) passes with 20ms gaps, vs.
+        // 3/3 audible crackle at the old unpaced 300-token default — at a cost of only ~0.2s
+        // of added latency on a 45s line, which is fine since this only delays the tail of
+        // generation, not a user-facing streaming gap. So paced decode is now the default;
+        // the knobs below just let it be overridden without a code change. Read fresh on
+        // every call — cheap, and it lets an A/B test flip them between generations without
+        // relaunching the app.
+        let resolvedChunkTokens = Qwen3DecodePacing.chunkTokensOverride() ?? Qwen3DecodePacing.defaultChunkTokens
+        let paceMs = Qwen3DecodePacing.paceMsOverride() ?? Qwen3DecodePacing.defaultPaceMs
+        if resolvedChunkTokens != Qwen3DecodePacing.defaultChunkTokens || paceMs != Qwen3DecodePacing.defaultPaceMs {
             let chunkCount = Int(ceil(Double(codes.dim(1)) / Double(resolvedChunkTokens)))
             print("qwen decode pacing: chunkTokens=\(resolvedChunkTokens) paceMs=\(paceMs) (\(chunkCount) chunks)")
         }
@@ -1406,15 +1410,22 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 // MARK: - Decode pacing knobs
 
 /// Runtime-tunable overrides for the vocoder decode chunk size and inter-chunk pacing used
-/// by `decodeChunk`/`streamingDecode`. These exist to soften the audio glitch that a run of
-/// huge, unpaced Metal decode passes causes on other apps' audio when this runs on a Mac
-/// alongside music playback. Both default to nil/0, i.e. today's behavior (300-token chunks,
-/// no sleep) — nothing changes unless one of these is explicitly set.
+/// by `decodeChunk`/`streamingDecode`. Paced decode (50-token chunks, 20ms gaps) is the
+/// default as of the 2026-08-23 A/B — see the comment in `decodeChunk` for why. These knobs
+/// exist so the defaults can be overridden (including turned off) without a code change.
 enum Qwen3DecodePacing {
-    /// Codec tokens per vocoder decode pass. `nil` means "use the caller's default" (300).
-    /// Checked via UserDefaults first (so it can be flipped from within the running app for
-    /// an A/B test), then an env var (for launch-time overrides), then falls through.
-    static func chunkTokens() -> Int? {
+    /// Default codec tokens per vocoder decode pass when no override is present.
+    static let defaultChunkTokens = 50
+    /// Default milliseconds to sleep between vocoder decode passes when no override is present.
+    static let defaultPaceMs = 20
+
+    /// Explicit chunk-size override, or `nil` if none is set (falls back to
+    /// `defaultChunkTokens`). Checked via UserDefaults first (so it can be flipped from
+    /// within the running app for an A/B test), then an env var (for launch-time overrides).
+    /// A chunk size of 0 or negative is nonsensical — unlike pace, there's no "off" for chunk
+    /// size — so a present-but-invalid value is treated as absent and the lookup continues to
+    /// the next source rather than being honored.
+    static func chunkTokensOverride() -> Int? {
         if let value = UserDefaults.standard.object(forKey: "qwenDecodeChunkTokens") as? Int, value > 0 {
             return value
         }
@@ -1426,17 +1437,20 @@ enum Qwen3DecodePacing {
         return nil
     }
 
-    /// Milliseconds to sleep between vocoder decode passes. 0 means no pacing (today's
-    /// behavior). Same UserDefaults-then-env lookup as `chunkTokens()`.
-    static func paceMs() -> Int {
-        if let value = UserDefaults.standard.object(forKey: "qwenDecodePaceMs") as? Int, value > 0 {
+    /// Explicit pace override, or `nil` if none is set (falls back to `defaultPaceMs`).
+    /// Unlike `chunkTokensOverride`, an explicit 0 here is meaningful — it disables pacing —
+    /// so 0 must be distinguished from "not set" rather than treated as invalid; that's why
+    /// this returns `Int?` instead of folding the default in directly. Same
+    /// UserDefaults-then-env lookup as `chunkTokensOverride()`.
+    static func paceMsOverride() -> Int? {
+        if let value = UserDefaults.standard.object(forKey: "qwenDecodePaceMs") as? Int, value >= 0 {
             return value
         }
         if let raw = ProcessInfo.processInfo.environment["MLX_AUDIO_QWEN_DECODE_PACE_MS"],
-           let value = Int(raw), value > 0
+           let value = Int(raw), value >= 0
         {
             return value
         }
-        return 0
+        return nil
     }
 }
