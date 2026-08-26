@@ -102,11 +102,23 @@ public final class SupertonicModel: SpeechGenerationModel, @unchecked Sendable {
 
     // MARK: - Voice styles
 
+    /// Whether `voice` names a custom style FILE rather than a bundled preset:
+    /// an absolute path to an existing .json in the same {style_ttl, style_dp}
+    /// document format the presets use. Lets callers render baked voice packs
+    /// (e.g. gloam .gvoice supertonic renditions) without copying them into the
+    /// model directory.
+    public static func isCustomStylePath(_ voice: String) -> Bool {
+        voice.hasPrefix("/") && voice.hasSuffix(".json")
+            && FileManager.default.fileExists(atPath: voice)
+    }
+
     func voiceStyle(_ name: String) throws -> (ttl: MLXArray, dp: MLXArray) {
         styleCacheLock.lock()
         defer { styleCacheLock.unlock() }
         if let cached = styleCache[name] { return cached }
-        let url = modelDirectory.appendingPathComponent("voice_styles/\(name).json")
+        let url = name.hasPrefix("/")
+            ? URL(fileURLWithPath: name)
+            : modelDirectory.appendingPathComponent("voice_styles/\(name).json")
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw SupertonicError.missingFile(url.path)
         }
@@ -205,9 +217,12 @@ public final class SupertonicModel: SpeechGenerationModel, @unchecked Sendable {
         language: String?,
         generationParameters: GenerateParameters
     ) async throws -> MLXArray {
-        // Preset voices only in this slice; refAudio/refText are ignored.
+        // Preset voice name, or an absolute path to a custom style .json (see
+        // isCustomStylePath); refAudio/refText are ignored either way.
         var voiceName = voice ?? "M1"
-        if !Self.presetVoices.contains(voiceName) { voiceName = "M1" }
+        if !Self.presetVoices.contains(voiceName), !Self.isCustomStylePath(voiceName) {
+            voiceName = "M1"
+        }
         let lang = SupertonicTextFrontend.availableLangs.contains(language ?? "en")
             ? (language ?? "en") : "en"
         return try synthesize(text: text, voice: voiceName, language: lang)
