@@ -7,7 +7,11 @@ import MLXNN
 /// Dia2's rotary embedding. Timescales are geometric between min and max, and
 /// the rotation splits the head dim in half (`[-x2, x1]`), matching the
 /// reference's `torch.chunk(x, 2, dim=-1)` — NOT the interleaved variant.
-final class Dia2RoPE: Module {
+/// Deliberately NOT a `Module`: the cos/sin tables are constants derived from
+/// the config, not learned weights. As a Module they would be collected as
+/// parameters and `update(parameters:verify: .all)` would demand they appear in
+/// model.safetensors, which they never do.
+final class Dia2RoPE {
     private let cosCache: MLXArray
     private let sinCache: MLXArray
 
@@ -26,7 +30,6 @@ final class Dia2RoPE: Module {
         let emb = concatenated([freqs, freqs], axis: -1)   // [maxSeqLen, headDim]
         cosCache = cos(emb)
         sinCache = sin(emb)
-        super.init()
     }
 
     /// - Parameters:
