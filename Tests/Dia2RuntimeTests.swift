@@ -282,4 +282,52 @@ final class Dia2RuntimeTests: XCTestCase {
         let parser = Dia2ScriptParser(tokenIDs: makeIDs(), frameRate: 12.5)
         XCTAssertTrue(parser.parse(["", "   "], tokenizer: FakeTokenizer()).isEmpty)
     }
+    /// Delay then undelay is the identity on the original span — the property
+    /// the whole codebook interleaving rests on.
+    func testDelayAndUndelayRoundTrip() {
+        let delays = [0, 2, 3]
+        let aligned = MLXArray(0 ..< 12).reshaped([3, 4])
+        let delayed = Dia2Grid.delay(aligned, delays: delays, padID: 99)
+        XCTAssertEqual(delayed.shape, [3, 4 + 3])
+        let back = Dia2Grid.undelay(delayed, delays: delays, padID: 99)
+        XCTAssertEqual(back.shape, [3, 4])
+        XCTAssertTrue(MLX.all(back .== aligned).item(Bool.self))
+    }
+
+    func testDelayPadsTheLeadingFramesOfDelayedCodebooks() {
+        let delayed = Dia2Grid.delay(MLXArray(0 ..< 4).reshaped([2, 2]), delays: [0, 2], padID: 99)
+        XCTAssertEqual(delayed[1, 0].item(Int32.self), 99)
+        XCTAssertEqual(delayed[1, 1].item(Int32.self), 99)
+        XCTAssertEqual(delayed[1, 2].item(Int32.self), 2)
+    }
+
+    /// PAD and BOS must be unreachable by sampling; they are control tokens.
+    func testMaskingDrivesPadAndBosToNegativeInfinity() {
+        let logits = MLXArray(converting: [1.0, 2.0, 3.0, 4.0] as [Double]).reshaped([1, 1, 4])
+        let masked = Dia2Grid.maskAudioLogits(logits, padIdx: 3, bosIdx: 2)
+        XCTAssertLessThan(masked[0, 0, 2].item(Float.self), -1e30)
+        XCTAssertLessThan(masked[0, 0, 3].item(Float.self), -1e30)
+        XCTAssertEqual(masked[0, 0, 0].item(Float.self), 1.0, accuracy: 1e-6)
+    }
+
+    /// scale == 1 is the identity, so unguided runs cost nothing extra.
+    func testGuidanceIsIdentityAtScaleOne() {
+        let logits = MLXArray(converting: [1.0, 2.0, 5.0, 0.0] as [Double]).reshaped([2, 1, 2])
+        let out = Dia2Guidance.apply(logits, active: false, scale: 1.0, filterK: 0)
+        XCTAssertEqual(out.shape, [2, 1, 2])
+    }
+
+    /// Guidance extrapolates away from the unconditional branch.
+    func testGuidancePushesPastTheConditionalBranch() {
+        // cond = [0, 4], uncond = [0, 0]; lerp(uncond, cond, 2) = [0, 8].
+        let logits = MLXArray(converting: [0.0, 4.0, 0.0, 0.0] as [Double]).reshaped([2, 1, 2])
+        let out = Dia2Guidance.apply(logits, active: true, scale: 2.0, filterK: 0)
+        XCTAssertEqual(out.shape, [1, 1, 2])
+        XCTAssertGreaterThan(out[0, 0, 1].item(Float.self), 4.0)
+    }
+
+    func testZeroTemperatureIsArgmax() {
+        let logits = MLXArray(converting: [0.1, 9.0, 0.2] as [Double]).reshaped([1, 1, 3])
+        XCTAssertEqual(Dia2Sampler.sample(logits, temperature: 0, topK: 0, key: nil), 1)
+    }
 }
