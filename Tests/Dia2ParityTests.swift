@@ -56,4 +56,35 @@ final class Dia2ParityTests: XCTestCase {
             assertParity(out.hidden, fx["hidden_\(t)"]!, tol: 2e-3, "hidden t=\(t)")
         }
     }
+    func testDepformerMatchesTheReference() throws {
+        let fx = try Self.fixture()
+        let dir = try Self.modelDir()
+        let config = try JSONDecoder().decode(
+            Dia2Config.self, from: Data(contentsOf: dir.appendingPathComponent("config.json")))
+
+        let transformer = Dia2Transformer(config: config)
+        try transformer.loadWeights(from: dir)
+        let depformer = Dia2Depformer(config: config)
+        try depformer.loadWeights(from: dir)
+
+        let tokens = fx["tokens"]!
+        let channels = config.data.channels
+        let depCache = depformer.makeCache()
+
+        for t in 0 ..< 8 {
+            // The reference feeds its own hidden state in; use the fixture's so
+            // a transformer regression cannot masquerade as a depformer pass.
+            let hidden = fx["hidden_\(t)"]!
+            depformer.resetCache(depCache)
+            var prev = tokens[0..., 2, t]
+            for stage in 0 ..< depformer.numDepth {
+                let logits = depformer.step(
+                    stage: stage, prevAudio: prev, hidden: hidden, cache: depCache,
+                    mainText: stage == 0 ? tokens[0..., 0, t] : nil,
+                    secondText: stage == 0 ? tokens[0..., 1, t] : nil)
+                assertParity(logits, fx["dep_\(t)_\(stage)"]!, tol: 2e-3, "dep t=\(t) stage=\(stage)")
+                prev = (3 + stage) < channels ? tokens[0..., 3 + stage, t] : prev
+            }
+        }
+    }
 }
