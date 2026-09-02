@@ -107,4 +107,12 @@ final class Dia2ParityTests: XCTestCase {
         XCTAssertLessThanOrEqual(samples.map(abs).max() ?? 0, 1.0, "output must be in range")
         XCTAssertGreaterThan(samples.map(abs).max() ?? 0, 0.01, "output must not be silence")
     }
+    func testFacadeExposesTagsAndSampleRate() async throws {
+        let dir = try Self.modelDir()
+        let model = try await Dia2Model.load(from: dir)
+        XCTAssertEqual(model.sampleRate, 24000)
+        XCTAssertTrue(model.nonverbalTags.contains("(laughs)"))
+        XCTAssertTrue(model.nonverbalTags.contains("(sighs)"))
+        XCTAssertFalse(model.nonverbalTags.contains("[S1]"), "speaker tags are not nonverbals")
+    }
 }
