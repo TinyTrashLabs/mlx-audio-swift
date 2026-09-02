@@ -119,4 +119,167 @@ final class Dia2RuntimeTests: XCTestCase {
         let out = mlp(x)
         XCTAssertEqual(out.shape, [1, 1, 4])
     }
+    private func makeIDs() -> Dia2TokenIDs {
+        Dia2TokenIDs(card: 49280, newWord: 2, pad: 3, bos: 1, zero: 7,
+                     spk1: 49152, spk2: 49153, audioPad: 2049, audioBos: 2048)
+    }
+
+    /// A sampled new-word token pops the next entry and starts emitting its
+    /// text tokens; everything else is padding.
+    func testNewWordConsumesAnEntryAndEmitsItsTokens() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 6, initialPadding: 0)
+        let state = machine.newState(entries: [
+            Dia2Entry(tokens: [100, 101], text: "hello", padding: 1),
+        ])
+        let first = machine.process(step: 0, state: state, token: ids.newWord)
+        XCTAssertEqual(first.main, ids.newWord)
+        XCTAssertTrue(first.consumedNewWord)
+        // The entry's own tokens drain on subsequent pad steps.
+        let second = machine.process(step: 1, state: state, token: ids.pad)
+        XCTAssertEqual(second.main, 100)
+        let third = machine.process(step: 2, state: state, token: ids.pad)
+        XCTAssertEqual(third.main, 101)
+    }
+
+    /// Anything that is not new-word or pad is coerced to pad — the sampler
+    /// only ever legitimately produces those two.
+    func testStrayTokensAreCoercedToPad() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 6, initialPadding: 0)
+        let state = machine.newState(entries: [Dia2Entry(tokens: [7], text: "x", padding: 0)])
+        // A word has to be consumed first. new_state starts padding_budget at
+        // initialPadding, so at 0 the machine is already out of budget and
+        // promotes any pad to new-word — which would mask the coercion here.
+        _ = machine.process(step: 0, state: state, token: ids.newWord)
+        _ = machine.process(step: 1, state: state, token: ids.pad)   // drains 7
+        XCTAssertEqual(machine.process(step: 2, state: state, token: 4242).main, ids.pad)
+    }
+
+    /// Once the padding budget runs out the machine forces the next word, so a
+    /// stuck sampler cannot stall the script forever.
+    func testExhaustedPaddingBudgetForcesTheNextWord() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 2, initialPadding: 0)
+        let state = machine.newState(entries: [
+            Dia2Entry(tokens: [10], text: "a", padding: 0),
+            Dia2Entry(tokens: [11], text: "b", padding: 0),
+        ])
+        _ = machine.process(step: 0, state: state, token: ids.newWord)  // takes "a", budget := 2
+        _ = machine.process(step: 1, state: state, token: ids.pad)      // drains 10, budget 2 -> 1
+        _ = machine.process(step: 2, state: state, token: ids.pad)      // budget 1 -> 0
+        // Only a pad that is actually emitted spends budget, and consuming a
+        // word resets it, so the force lands on the next step — not one later.
+        let forced = machine.process(step: 3, state: state, token: ids.pad)
+        XCTAssertTrue(forced.consumedNewWord, "budget exhausted must force a word")
+    }
+
+    /// A break entry (no tokens) spends frames as silence rather than speech.
+    func testForcedPaddingFromABreakBlocksNewWords() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 6, initialPadding: 0)
+        let state = machine.newState(entries: [
+            Dia2Entry(tokens: [], text: "", padding: 3),
+            Dia2Entry(tokens: [20], text: "after", padding: 0),
+        ])
+        // Consuming the break sets forcedPadding = 3 and immediately spends one
+        // of it on that same frame, so it blocks steps 1 and 2 and expires
+        // before step 3.
+        _ = machine.process(step: 0, state: state, token: ids.newWord)   // consumes the break
+        for step in 1 ... 2 {
+            let r = machine.process(step: step, state: state, token: ids.newWord)
+            XCTAssertFalse(r.consumedNewWord, "forced padding must hold at step \(step)")
+        }
+        XCTAssertTrue(machine.process(step: 3, state: state, token: ids.newWord).consumedNewWord,
+                      "forced padding must expire, not stall the script")
+    }
+
+    /// End step is recorded once the script is spent, so the caller knows when
+    /// to start the delay-flush tail instead of running to the context cap.
+    func testEndStepIsRecordedWhenEntriesRunOut() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 6, initialPadding: 0)
+        let state = machine.newState(entries: [])
+        XCTAssertNil(state.endStep)
+        _ = machine.process(step: 9, state: state, token: ids.newWord)
+        XCTAssertEqual(state.endStep, 9)
+    }
+
+    /// With lookahead on, the second stream carries the NEXT entry's tokens so
+    /// the model can anticipate the upcoming word.
+    func testSecondStreamCarriesLookahead() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 2,
+                                       maxPadding: 6, initialPadding: 0)
+        let state = machine.newState(entries: [
+            Dia2Entry(tokens: [30], text: "one", padding: 0),
+            Dia2Entry(tokens: [31], text: "two", padding: 0),
+        ])
+        let r = machine.process(step: 0, state: state, token: ids.newWord)
+        XCTAssertEqual(r.second, ids.newWord)
+        XCTAssertEqual(r.main, 30, "main advances past new-word when multiplexing")
+    }
+
+    /// Appending mid-run is what makes streaming possible: the Chat tab feeds
+    /// words in as the LLM writes them.
+    func testEntriesCanBeAppendedWhileRunning() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 6, initialPadding: 0)
+        let state = machine.newState(entries: [Dia2Entry(tokens: [40], text: "a", padding: 0)])
+        _ = machine.process(step: 0, state: state, token: ids.newWord)
+        state.append([Dia2Entry(tokens: [41], text: "b", padding: 0)])
+        _ = machine.process(step: 1, state: state, token: ids.pad)
+        let r = machine.process(step: 2, state: state, token: ids.newWord)
+        XCTAssertTrue(r.consumedNewWord)
+        XCTAssertNil(state.endStep, "appending must clear a premature end")
+    }
+    /// Deterministic stand-in: one id per character code, so assertions can be
+    /// written against text without loading a real tokenizer.
+    private struct FakeTokenizer: Dia2TextTokenizing {
+        func encode(_ text: String) -> [Int] { text.unicodeScalars.map { Int($0.value) } }
+    }
+
+    func testSpeakerTagPrefixesTheFirstWordOfATurn() {
+        let parser = Dia2ScriptParser(tokenIDs: makeIDs(), frameRate: 12.5)
+        let entries = parser.parse(["[S1] hello there"], tokenizer: FakeTokenizer())
+        XCTAssertEqual(entries.map(\.text), ["hello", "there"])
+        XCTAssertEqual(entries[0].tokens.first, makeIDs().spk1)
+        XCTAssertNotEqual(entries[1].tokens.first, makeIDs().spk1)
+    }
+
+    func testSecondSpeakerGetsItsOwnTag() {
+        let parser = Dia2ScriptParser(tokenIDs: makeIDs(), frameRate: 12.5)
+        let entries = parser.parse(["[S1] hi", "[S2] hey"], tokenizer: FakeTokenizer())
+        XCTAssertEqual(entries[0].tokens.first, makeIDs().spk1)
+        XCTAssertEqual(entries[1].tokens.first, makeIDs().spk2)
+    }
+
+    /// A break becomes a token-less entry whose padding is the pause in frames.
+    func testBreakTagBecomesPaddingFrames() {
+        let parser = Dia2ScriptParser(tokenIDs: makeIDs(), frameRate: 12.5)
+        let entries = parser.parse([#"[S1] wait <break time="2s"/> ok"#], tokenizer: FakeTokenizer())
+        let pause = entries.first { $0.tokens.isEmpty }
+        XCTAssertNotNil(pause)
+        XCTAssertEqual(pause?.padding, 25)   // 2.0s * 12.5 Hz
+        XCTAssertEqual(entries.filter { !$0.tokens.isEmpty }.map(\.text), ["wait", "ok"])
+    }
+
+    /// Curly apostrophes and colons are normalised before tokenising, matching
+    /// the reference — otherwise "S1:" style scripts tokenise unpredictably.
+    func testCurlyApostrophesAndColonsAreNormalised() {
+        let parser = Dia2ScriptParser(tokenIDs: makeIDs(), frameRate: 12.5)
+        let entries = parser.parse(["[S1] it\u{2019}s fine: really"], tokenizer: FakeTokenizer())
+        XCTAssertEqual(entries.map(\.text), ["it's", "fine", "really"])
+    }
+
+    func testEmptyScriptProducesNoEntries() {
+        let parser = Dia2ScriptParser(tokenIDs: makeIDs(), frameRate: 12.5)
+        XCTAssertTrue(parser.parse(["", "   "], tokenizer: FakeTokenizer()).isEmpty)
+    }
 }
