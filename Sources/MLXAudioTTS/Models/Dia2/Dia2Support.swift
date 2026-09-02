@@ -3,22 +3,7 @@ import MLX
 import MLXLMCommon
 import MLXAudioCodecs
 
-public struct Dia2PrefixPlan: @unchecked Sendable {
-    public let entries: [Dia2Entry]
-    public let newWordSteps: [Int]
-    public let alignedTokens: MLXArray
-    public let alignedFrames: Int
-}
 
-enum Dia2Prefix {
-    /// Filled in by Task 10. Unreachable until a caller passes a non-nil plan,
-    /// and the only caller in this task passes nil.
-    static func warmUp(_ plan: Dia2PrefixPlan, runtime: Dia2Runtime,
-                       machine: Dia2StateMachine, state: Dia2State,
-                       cache: [KVCacheSimple], branches: Int) throws -> Int {
-        fatalError("Dia2Prefix.warmUp lands in Task 10")
-    }
-}
 
 public extension Dia2Runtime {
     /// Builds a runtime from a local Dia2 checkout: config, both networks,

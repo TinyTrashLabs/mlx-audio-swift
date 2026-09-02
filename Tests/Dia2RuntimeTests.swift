@@ -330,4 +330,27 @@ final class Dia2RuntimeTests: XCTestCase {
         let logits = MLXArray(converting: [0.1, 9.0, 0.2] as [Double]).reshaped([1, 1, 3])
         XCTAssertEqual(Dia2Sampler.sample(logits, temperature: 0, topK: 0, key: nil), 1)
     }
+    /// Word timings become entries whose padding spans the gap to the next
+    /// word, so the model is taught this speaker's actual rhythm.
+    func testWordsBecomeEntriesWithGapPadding() {
+        let words = [
+            Dia2Word(text: "hello", start: 0.0, end: 0.4),
+            Dia2Word(text: "there", start: 1.0, end: 1.4),
+        ]
+        let entries = Dia2Prefix.entries(for: words, speakerToken: makeIDs().spk1,
+                                         tokenizer: FakeTokenizer(), frameRate: 12.5)
+        XCTAssertEqual(entries.map(\.text), ["hello", "there"])
+        XCTAssertEqual(entries[0].tokens.first, makeIDs().spk1)
+        // 1.0s gap at 12.5 Hz is ~12 frames; the first entry must hold that long.
+        XCTAssertGreaterThan(entries[0].padding, 5)
+    }
+
+    func testNoPrefixWhenSpeakerOneIsAbsent() throws {
+        XCTAssertNil(try Dia2Prefix.plan(speaker1: nil, speaker2: nil, runtime: nil))
+    }
+
+    func testSpeakerTwoWithoutSpeakerOneIsRejected() {
+        let two = Dia2PrefixInput(samples: [0, 0, 0], words: [])
+        XCTAssertThrowsError(try Dia2Prefix.plan(speaker1: nil, speaker2: two, runtime: nil))
+    }
 }
