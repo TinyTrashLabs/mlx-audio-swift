@@ -102,6 +102,13 @@ public enum TTS {
         }
 
         switch resolvedType {
+        case "breeze", "breeze_tts":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await BreezeTTSModel.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try await BreezeTTSModel.fromModelDirectory(modelDir) }
+            )
         case "moss_tts_nano":
             return try await load(
                 source,
@@ -284,6 +291,9 @@ public enum TTS {
         let lower = modelRepo.lowercased()
         if lower.contains("dia2") || lower.contains("dia-2") {
             return "dia2"
+        }
+        if lower.contains("breeze") && lower.contains("tts") {
+            return "breeze"
         }
         if lower.contains("qwen3_tts") {
             return "qwen3_tts"
