@@ -1,0 +1,11 @@
+{
+  "_comment": "MLX's Metal library is not resolvable from a SwiftPM test binary, so `swift test` aborts here before running a single assertion — see CONTRIBUTING.md. xcodebuild is this repo's real test runner; declaring it keeps the dispatch gate meaningful instead of failing on every change including a no-op.",
+  "checks": [
+    ["typecheck", ["xcodebuild", "build-for-testing", "-scheme", "MLXAudio-Package",
+                   "-destination", "platform=macOS", "MACOSX_DEPLOYMENT_TARGET=14.0",
+                   "CODE_SIGNING_ALLOWED=NO"]],
+    ["tests", ["xcodebuild", "test-without-building", "-scheme", "MLXAudio-Package",
+               "-destination", "platform=macOS", "-skip-testing:MLXAudioTests/SmokeTests",
+               "-parallel-testing-enabled", "NO", "CODE_SIGNING_ALLOWED=NO"]]
+  ]
+}
