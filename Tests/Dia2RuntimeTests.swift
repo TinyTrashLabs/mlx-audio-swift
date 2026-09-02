@@ -1,4 +1,6 @@
 import Foundation
+import MLX
+import MLXNN
 import XCTest
 @testable import MLXAudioTTS
 
@@ -77,5 +79,44 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertEqual(config.data.textZeroTokenID, 7)
         XCTAssertEqual(config.runtime.maxContextSteps, 1500)
         XCTAssertTrue(config.data.delayPattern.isEmpty)
+    }
+    func testRoPEIsIdentityAtPositionZero() {
+        let rope = Dia2RoPE(headDim: 8, minTimescale: 1, maxTimescale: 10000, maxSeqLen: 16)
+        let x = MLXArray(converting: (0 ..< 8).map { Double($0) }).reshaped([1, 1, 1, 8])
+        let out = rope(x, positions: MLXArray([0]).reshaped([1, 1]))
+        XCTAssertLessThanOrEqual(abs(out - x).max().item(Float.self), 1e-5)
+    }
+
+    /// The rotation is norm-preserving; a wrong half-split silently is not.
+    func testRoPEPreservesNorm() {
+        let rope = Dia2RoPE(headDim: 8, minTimescale: 1, maxTimescale: 10000, maxSeqLen: 16)
+        let x = MLXArray(converting: (0 ..< 8).map { Double($0) * 0.3 - 1 }).reshaped([1, 1, 1, 8])
+        let out = rope(x, positions: MLXArray([5]).reshaped([1, 1]))
+        let before = (x * x).sum().item(Float.self)
+        let after = (out * out).sum().item(Float.self)
+        XCTAssertEqual(before, after, accuracy: 1e-4)
+    }
+
+    /// A pad in the second stream must contribute nothing — that gate is how
+    /// the model knows a lookahead slot is empty rather than a real word.
+    func testMultiStreamEmbeddingGatesThePadSecondStream() {
+        let embed = MultiStreamEmbedding(vocabSize: 16, dim: 4, padID: 3, lowRankDim: nil)
+        MLXRandom.seed(0)
+        eval(embed)
+        let padded = embed(MLXArray([1]).reshaped([1, 1]), MLXArray([3]).reshaped([1, 1]))
+        let mainOnly = embed.mainOnly(MLXArray([1]).reshaped([1, 1]))
+        XCTAssertLessThanOrEqual(abs(padded - mainOnly).max().item(Float.self), 1e-6)
+
+        let real = embed(MLXArray([1]).reshaped([1, 1]), MLXArray([2]).reshaped([1, 1]))
+        XCTAssertGreaterThan(abs(real - mainOnly).max().item(Float.self), 1e-6)
+    }
+
+    func testMlpIsGatedNotSequential() {
+        // activations ["silu","linear"] => silu(gate) * up, one wi of width 2*hidden.
+        let mlp = Dia2Mlp(dim: 4, hidden: 8, activations: ["silu", "linear"])
+        eval(mlp)
+        let x = MLXArray(converting: [0.5, -0.25, 1.0, 0.0] as [Double]).reshaped([1, 1, 4])
+        let out = mlp(x)
+        XCTAssertEqual(out.shape, [1, 1, 4])
     }
 }
