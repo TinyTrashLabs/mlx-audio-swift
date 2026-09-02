@@ -87,4 +87,24 @@ final class Dia2ParityTests: XCTestCase {
             }
         }
     }
+    func testGeneratesAudioAndStopsWithoutHittingTheContextCap() async throws {
+        let dir = try Self.modelDir()
+        let runtime = try await Dia2Runtime.load(from: dir)
+        var config = Dia2GenerationConfig()
+        config.audioTemperature = 0.0   // greedy, so the test is deterministic
+        config.textTemperature = 0.0
+        config.cfgScale = 1.0           // single branch: faster, still exercises the loop
+
+        let session = Dia2Session(runtime: runtime, config: config, prefix: nil)
+        await session.append(["[S1] Hello there. [S2] Hi."])
+        await session.finish()
+
+        var samples: [Float] = []
+        for try await chunk in session.audio { samples.append(contentsOf: chunk.samples) }
+
+        XCTAssertGreaterThan(samples.count, 12_000, "expected at least ~0.5s of audio")
+        XCTAssertLessThan(samples.count, 24_000 * 30, "must stop well before the 2-minute cap")
+        XCTAssertLessThanOrEqual(samples.map(abs).max() ?? 0, 1.0, "output must be in range")
+        XCTAssertGreaterThan(samples.map(abs).max() ?? 0, 0.01, "output must not be silence")
+    }
 }
