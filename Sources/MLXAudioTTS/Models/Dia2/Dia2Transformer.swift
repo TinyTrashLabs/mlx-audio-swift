@@ -93,6 +93,7 @@ public extension Dia2Transformer {
             guard kv.key.hasPrefix("transformer.") else { return }
             out[String(kv.key.dropFirst("transformer.".count))] = kv.value
         }
+        Dia2Quantization.apply(to: self, weights: mine, config: config)
         try update(parameters: ModuleParameters.unflattened(mine), verify: .all)
         eval(self)
     }

@@ -186,6 +186,7 @@ public final class Dia2Depformer: Module {
             guard kv.key.hasPrefix("depformer.") else { return }
             out[String(kv.key.dropFirst("depformer.".count))] = kv.value
         }
+        Dia2Quantization.apply(to: self, weights: mine, config: config)
         try update(parameters: ModuleParameters.unflattened(mine), verify: .all)
         eval(self)
     }
