@@ -157,6 +157,12 @@ public enum TTS {
                 modelType: resolvedType,
                 pretrained: { try await MarvisTTSModel.fromPretrained($0, cache: $1) }
             )
+        case "dia2", "dia_v2":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await Dia2Model.fromPretrained($0, cache: $1) }
+            )
         case "soprano_tts", "soprano":
             return try await load(
                 source,
