@@ -9,11 +9,38 @@ public struct Dia2GenerationConfig: Sendable {
     public var textTopK: Int = 50
     public var audioTemperature: Float = 0.8
     public var audioTopK: Int = 50
+    /// How hard generation is pushed toward the script and away from an
+    /// unconditioned pass. Nari's Space defaults to 6.0 and offers 1–8, and
+    /// raising it does cure the silence collapse seen at 2.0 — but it is a
+    /// contrast knob, not a correctness one, and past its sweet spot the
+    /// output turns harsh. 2.0 is what we have actually judged by ear.
+    /// Expose it; do not tune it by a silence metric.
     public var cfgScale: Float = 2.0
     public var cfgFilterK: Int = 50
     /// Frames of silence before the first word may start.
-    public var initialPadding: Int = 2
+    ///
+    /// 2, not the checkpoint's `first_word_min_start` of 3: the reference
+    /// implementation puts its first word at 0.16s, which is frame 2. Those
+    /// are different quantities — a floor on the first word's scheduled step
+    /// is not the same as the padding budget the state machine opens with.
+    public var initialPadding: Int? = 2
+    /// How many frames the model may wait between words before one is forced.
+    /// This is Dia2's own pacing control: raising it lets the delivery breathe,
+    /// lowering it presses on. nil keeps the checkpoint's own `max_pad`.
+    ///
+    /// Prefer this over resampling the output. Resampling stretches the
+    /// waveform, so it drops the pitch with the pace and the voice sounds
+    /// wrong; padding changes only how long the model waits between words.
+    public var maxPadding: Int?
     public init() {}
+
+    public func effectiveInitialPadding(for config: Dia2Config) -> Int {
+        initialPadding ?? config.data.firstWordMinStart
+    }
+
+    func effectiveMaxPadding(for config: Dia2Config) -> Int {
+        max(maxPadding ?? config.data.maxPad, 1)
+    }
 }
 
 /// One emission: decoded samples plus any words that began inside it.
@@ -57,8 +84,9 @@ public actor Dia2Session {
         let data = runtime.config.data
         machine = Dia2StateMachine(tokenIDs: runtime.tokenIDs,
                                    secondStreamAhead: data.secondStreamAhead,
-                                   maxPadding: max(data.maxPad, 1),
-                                   initialPadding: config.initialPadding)
+                                   maxPadding: config.effectiveMaxPadding(for: runtime.config),
+                                   initialPadding:
+                                       config.effectiveInitialPadding(for: runtime.config))
         state = machine.newState(entries: prefix?.entries ?? [])
         parser = Dia2ScriptParser(tokenIDs: runtime.tokenIDs, frameRate: runtime.mimi.frameRate)
         (audio, continuation) = AsyncThrowingStream<Dia2Chunk, Error>.makeStream()
@@ -223,9 +251,12 @@ enum Dia2Loop {
             }
 
             // A frame is only real once every codebook's delay has elapsed.
+            // `audioBuf` is the DELAYED grid, so the frame has to be gathered
+            // per codebook at its own offset — a raw column would mix codebooks
+            // from up to maxDelay different frames.
             let readyIndex = t - maxDelay
             if readyIndex >= 0 {
-                let frame = audioBuf[0..., readyIndex ..< (readyIndex + 1)]
+                let frame = Dia2Grid.frame(audioBuf, outputIndex: readyIndex, delays: delays)
                 let pcm = decoder.decodeFrames(frame.expandedDimensions(axis: 0))
                 eval(pcm)
                 let samples = pcm.reshaped([-1]).asArray(Float.self)

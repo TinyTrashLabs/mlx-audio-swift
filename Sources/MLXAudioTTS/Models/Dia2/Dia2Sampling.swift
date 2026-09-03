@@ -29,6 +29,24 @@ public enum Dia2Grid {
         return out
     }
 
+    /// One output frame, gathered out of the delay-shifted grid.
+    ///
+    /// The generation loop writes into the DELAYED grid, where codebook `cb` at
+    /// column `c` holds output frame `c - delays[cb]`. So the frame the codec
+    /// needs is never a column: it is one value per codebook, each read at its
+    /// own offset. Slicing a column instead hands the codec a mix of codebooks
+    /// from up to maxDelay different frames.
+    public static func frame(_ delayed: MLXArray, outputIndex: Int,
+                             delays: [Int]) -> MLXArray {
+        let channels = delayed.dim(0)
+        let columns = (0 ..< channels).map { cb -> MLXArray in
+            let delay = cb < delays.count ? delays[cb] : 0
+            let column = outputIndex + delay
+            return delayed[cb, column ..< (column + 1)]
+        }
+        return stacked(columns, axis: 0)
+    }
+
     /// PAD and BOS are control tokens; sampling either would emit a click.
     public static func maskAudioLogits(_ logits: MLXArray, padIdx: Int, bosIdx: Int) -> MLXArray {
         let vocab = logits.dim(-1)
@@ -54,7 +72,11 @@ public enum Dia2Guidance {
         // Keep the guided top-k, but score them with the CONDITIONAL logits —
         // guidance selects the candidates, it does not distort their ranking.
         let k = min(filterK, guided.dim(-1))
-        let threshold = MLX.top(guided, k: k, axis: -1)[.ellipsis, (k - 1) ..< k]
+        if k == guided.dim(-1) { return conditional.asType(logits.dtype) }
+        // MLX documents `top` as unsorted. Its last value is not necessarily
+        // the kth largest, so reduce the selected values to their true floor.
+        let threshold = MLX.min(MLX.top(guided, k: k, axis: -1),
+                                axis: -1, keepDims: true)
         let keep = guided .>= threshold
         let negInf = MLXArray(-Float.infinity)
         return MLX.where(keep, conditional, negInf).asType(logits.dtype)
@@ -73,7 +95,7 @@ public enum Dia2Sampler {
         let vocab = scaled.dim(-1)
         if topK > 0 && topK < vocab {
             let top = MLX.top(scaled, k: topK, axis: -1)
-            let threshold = top[.ellipsis, (topK - 1) ..< topK]
+            let threshold = MLX.min(top, axis: -1, keepDims: true)
             let filtered = MLX.where(scaled .>= threshold, scaled, MLXArray(-Float.infinity))
             return MLXRandom.categorical(filtered, key: key).item(Int32.self).asInt
         }

@@ -20,7 +20,12 @@ public extension Dia2Runtime {
         let data = config.data
         let ids = Dia2TokenIDs(
             card: data.textVocabSize, newWord: data.textNewWordTokenID, pad: data.textPadTokenID,
-            bos: tokenizer.bosTokenID ?? 1, zero: data.textZeroTokenID,
+            // The reference reads `getattr(tokenizer, "bos_token_id", 1) or 1`.
+            // That trailing `or 1` also replaces a ZERO, because 0 is falsy in
+            // Python — Swift's `??` only replaces nil. This tokenizer reports 0,
+            // so we fed 0 where the reference feeds 1, and the very first token
+            // of every generation was wrong.
+            bos: Dia2TokenIDs.resolvedBOS(tokenizer.bosTokenID), zero: data.textZeroTokenID,
             spk1: tokenizer.id(of: "[S1]") ?? data.textNewWordTokenID,
             spk2: tokenizer.id(of: "[S2]") ?? data.textNewWordTokenID,
             audioPad: data.audioPadTokenID, audioBos: data.audioBosTokenID)

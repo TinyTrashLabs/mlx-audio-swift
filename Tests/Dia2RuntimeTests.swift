@@ -57,6 +57,12 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertNil(config.assets)
     }
 
+    func testZeroBOSTokenFallsBackToOneLikeTheReference() {
+        XCTAssertEqual(Dia2TokenIDs.resolvedBOS(nil), 1)
+        XCTAssertEqual(Dia2TokenIDs.resolvedBOS(0), 1)
+        XCTAssertEqual(Dia2TokenIDs.resolvedBOS(42), 42)
+    }
+
     /// numDepth and numAudioChannels are derived from `channels`, not declared,
     /// so a different channel count must move them.
     func testDerivedCountsFollowChannels() throws {
@@ -294,6 +300,73 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertTrue(MLX.all(back .== aligned).item(Bool.self))
     }
 
+    /// CFG is a contrast knob with a sweet spot, not a dial that improves as
+    /// it rises. 6.0 (Nari's Space default) removes the silence collapse but
+    /// sounds overdriven; 2.0 is the value judged acceptable by ear. Pinned so
+    /// nobody re-tunes it from a silence metric again.
+    func testCfgScaleDefaultsToTheValueJudgedByEar() {
+        XCTAssertEqual(Dia2GenerationConfig().cfgScale, 2.0)
+    }
+
+    /// The first word lands at frame 2, matching the reference's 0.16s. The
+    /// checkpoint's `first_word_min_start` of 3 is a floor on a word's
+    /// scheduled step, which is a different quantity — do not conflate them.
+    func testInitialPaddingMatchesTheReferenceOpening() throws {
+        let data = try Data(contentsOf: Self.fixtureURL("config-2b.json"))
+        let config = try JSONDecoder().decode(Dia2Config.self, from: data)
+        var gen = Dia2GenerationConfig()
+        XCTAssertEqual(gen.effectiveInitialPadding(for: config), 2)
+        gen.initialPadding = 0
+        XCTAssertEqual(gen.effectiveInitialPadding(for: config), 0,
+                       "an explicit choice still wins")
+    }
+
+    /// And the padding actually has to hold the first word back that long.
+    func testTheFirstWordWaitsOutTheInitialPadding() {
+        let ids = makeIDs()
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 8, initialPadding: 3)
+        let state = machine.newState(entries: [Dia2Entry(tokens: [7], text: "hi")])
+        var firstWordStep: Int?
+        for step in 0 ..< 12 {
+            let out = machine.process(step: step, state: state, token: ids.newWord)
+            if firstWordStep == nil, out.main != ids.pad { firstWordStep = step }
+        }
+        XCTAssertEqual(firstWordStep, 3, "the first word may not land before frame 3")
+    }
+
+    /// The decode path pulls ONE frame at a time out of the delay-shifted grid
+    /// it has been generating into. Taking a raw column there is wrong: in that
+    /// grid codebook `cb` at column `c` holds output frame `c - delays[cb]`, so
+    /// a column mixes codebooks from up to maxDelay different frames. Dia2's
+    /// real pattern delays codebook 0 by 16 and the rest by 18, which smears
+    /// every residual codebook 160ms away from the coarse one it belongs to.
+    func testFrameGathersOneOutputFrameAcrossTheDelays() {
+        let delays = [0, 2, 3]
+        let aligned = MLXArray(0 ..< 12).reshaped([3, 4])
+        let delayed = Dia2Grid.delay(aligned, delays: delays, padID: 99)
+        for u in 0 ..< 4 {
+            let frame = Dia2Grid.frame(delayed, outputIndex: u, delays: delays)
+            XCTAssertEqual(frame.shape, [3, 1], "frame \(u): shape")
+            XCTAssertTrue(MLX.all(frame .== aligned[0..., u ..< (u + 1)]).item(Bool.self),
+                          "frame \(u) must equal the aligned column, not the delayed one")
+        }
+    }
+
+    /// The same property stated against `undelay`, so the two paths into Mimi —
+    /// whole-grid and frame-at-a-time — can never disagree.
+    func testFrameAgreesWithUndelay() {
+        let delays = [16, 18, 18]
+        let aligned = MLXArray(0 ..< 90).reshaped([3, 30])
+        let delayed = Dia2Grid.delay(aligned, delays: delays, padID: 99)
+        let undelayed = Dia2Grid.undelay(delayed, delays: delays, padID: 99)
+        for u in 0 ..< undelayed.dim(1) {
+            let frame = Dia2Grid.frame(delayed, outputIndex: u, delays: delays)
+            XCTAssertTrue(MLX.all(frame .== undelayed[0..., u ..< (u + 1)]).item(Bool.self),
+                          "frame \(u) disagrees with undelay")
+        }
+    }
+
     func testDelayPadsTheLeadingFramesOfDelayedCodebooks() {
         let delayed = Dia2Grid.delay(MLXArray(0 ..< 4).reshaped([2, 2]), delays: [0, 2], padID: 99)
         XCTAssertEqual(delayed[1, 0].item(Int32.self), 99)
@@ -326,9 +399,45 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertGreaterThan(out[0, 0, 1].item(Float.self), 4.0)
     }
 
+    /// Filtering with k >= vocabulary size must keep every candidate. MLX's
+    /// `top` result is explicitly unsorted, so treating its last value as the
+    /// threshold can accidentally collapse a two-action distribution to one.
+    func testGuidanceFilterKeepsTheWholeActionVocabulary() {
+        let logits = MLXArray(converting: [0.0, 4.0, 0.0, 0.0] as [Double])
+            .reshaped([2, 1, 2])
+        let out = Dia2Guidance.apply(logits, active: true, scale: 2.0, filterK: 50)
+        XCTAssertEqual(out[0, 0, 0].item(Float.self), 0.0, accuracy: 1e-6)
+        XCTAssertEqual(out[0, 0, 1].item(Float.self), 4.0, accuracy: 1e-6)
+    }
+
+    /// The CFG filter keeps exactly the k candidates selected by guided
+    /// logits, while returning their conditional scores for sampling.
+    func testGuidanceFilterKeepsExactlyTheGuidedTopK() {
+        let logits = MLXArray(converting: [10.0, 20.0, 30.0, 40.0,
+                                           0.0, 15.0, 29.0, 39.0] as [Double])
+            .reshaped([2, 1, 4])
+        let out = Dia2Guidance.apply(logits, active: true, scale: 2.0, filterK: 2)
+        XCTAssertLessThan(out[0, 0, 0].item(Float.self), -1e30)
+        XCTAssertLessThan(out[0, 0, 1].item(Float.self), -1e30)
+        XCTAssertEqual(out[0, 0, 2].item(Float.self), 30.0, accuracy: 1e-6)
+        XCTAssertEqual(out[0, 0, 3].item(Float.self), 40.0, accuracy: 1e-6)
+    }
+
     func testZeroTemperatureIsArgmax() {
         let logits = MLXArray(converting: [0.1, 9.0, 0.2] as [Double]).reshaped([1, 1, 3])
         XCTAssertEqual(Dia2Sampler.sample(logits, temperature: 0, topK: 0, key: nil), 1)
+    }
+
+    /// Top-k sampling must keep all k candidates, not only whichever value
+    /// happens to be last in MLX's explicitly unsorted `top` output.
+    func testTopKSamplingCanDrawEveryKeptCandidate() {
+        MLX.seed(20260903)
+        let logits = MLXArray(converting: [2.0, 1.0, -100.0] as [Double])
+            .reshaped([1, 1, 3])
+        let draws = Set((0 ..< 100).map { _ in
+            Dia2Sampler.sample(logits, temperature: 1, topK: 2, key: nil)
+        })
+        XCTAssertEqual(draws, Set([0, 1]))
     }
     /// Word timings become entries whose padding spans the gap to the next
     /// word, so the model is taught this speaker's actual rhythm.

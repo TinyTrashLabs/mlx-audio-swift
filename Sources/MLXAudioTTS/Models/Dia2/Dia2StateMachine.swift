@@ -18,6 +18,12 @@ public struct Dia2TokenIDs: Sendable, Equatable {
         self.zero = zero; self.spk1 = spk1; self.spk2 = spk2
         self.audioPad = audioPad; self.audioBos = audioBos
     }
+
+    /// Mirrors Python's `candidate or 1`: nil and zero both fall back to 1.
+    static func resolvedBOS(_ candidate: Int?) -> Int {
+        guard let candidate, candidate != 0 else { return 1 }
+        return candidate
+    }
 }
 
 /// One scheduling unit: a word's text tokens, plus how many frames of silence
