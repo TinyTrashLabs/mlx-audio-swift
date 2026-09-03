@@ -60,11 +60,18 @@ def convert(src: Path, out: Path, precision: str, source: str) -> None:
         for key, value in weights.items():
             # Quantise 2-D projection/embedding matrices only; norms, biases and
             # anything narrower than the group size stay bf16.
+            #
+            # `scales`/`biases` are SIBLINGS of `weight`, not children of it —
+            # that is MLX's own layout, and it is what lets a loader unflatten
+            # the keys straight onto a QuantizedLinear/QuantizedEmbedding. An
+            # earlier revision wrote `<key>.weight.scales`, which unflattens as
+            # a dict nested under `weight` and fails to load at all.
             if value.ndim == 2 and value.shape[-1] % GROUP_SIZE == 0:
                 w, scales, biases = mx.quantize(value, group_size=GROUP_SIZE, bits=bits)
+                base = key[: -len(".weight")] if key.endswith(".weight") else key
                 quantized[key] = w
-                quantized[f"{key}.scales"] = scales
-                quantized[f"{key}.biases"] = biases
+                quantized[f"{base}.scales"] = scales
+                quantized[f"{base}.biases"] = biases
             else:
                 quantized[key] = value
         weights = quantized

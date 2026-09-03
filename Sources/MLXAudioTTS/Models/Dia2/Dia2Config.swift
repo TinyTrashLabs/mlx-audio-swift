@@ -7,6 +7,18 @@ public struct Dia2Config: Codable, Sendable {
     public let model: ModelConfig
     public let runtime: RuntimeConfig
     public let assets: AssetsConfig?
+    /// Present only in our converted repos. Nari ship bf16, so a checkpoint
+    /// straight from them decodes this as nil and loads unquantized.
+    public let quantization: QuantizationConfig?
+
+    public struct QuantizationConfig: Codable, Sendable {
+        public let groupSize: Int
+        public let bits: Int
+        enum CodingKeys: String, CodingKey {
+            case groupSize = "group_size"
+            case bits
+        }
+    }
 
     public struct DataConfig: Codable, Sendable {
         /// Total streams: 2 text + N audio codebooks.
@@ -178,7 +190,7 @@ public struct Dia2Config: Codable, Sendable {
         public let mimi: String?
     }
 
-    enum CodingKeys: String, CodingKey { case data, model, runtime, assets }
+    enum CodingKeys: String, CodingKey { case data, model, runtime, assets, quantization }
 
     public init(from decoder: Swift.Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -186,6 +198,7 @@ public struct Dia2Config: Codable, Sendable {
         var m = try c.decode(ModelConfig.self, forKey: .model)
         runtime = try c.decode(RuntimeConfig.self, forKey: .runtime)
         assets = try c.decodeIfPresent(AssetsConfig.self, forKey: .assets)
+        quantization = try c.decodeIfPresent(QuantizationConfig.self, forKey: .quantization)
         // Depth is derived, not declared: one depformer stage per codebook
         // after codebook 0, which the transformer's own head produces.
         m.depformer.numDepth = max(0, data.numAudioChannels - 1)

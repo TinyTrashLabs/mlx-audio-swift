@@ -21,12 +21,32 @@ final class Dia2ParityTests: XCTestCase {
         return try loadArrays(url: url)
     }
 
-    /// Directory holding Dia2-1B's config.json + model.safetensors in fp32.
+    /// Directory holding Dia2-1B's config.json + model.safetensors. Any
+    /// precision: loading and generating must work for every tier we publish.
     static func modelDir() throws -> URL {
         guard let path = ProcessInfo.processInfo.environment["DIA2_MODEL_DIR"] else {
             throw XCTSkip("set DIA2_MODEL_DIR to a Dia2-1B checkout")
         }
         return URL(fileURLWithPath: path)
+    }
+
+    /// The same directory, but only when the weights are float32 — the
+    /// precision Tools/dia2-parity-dump.py dumped the fixture at.
+    ///
+    /// Element-wise parity against a torch dump is a statement about the PORT,
+    /// not about a checkpoint's precision. bf16 misses the 2e-3 tolerance by
+    /// an order of magnitude (0.03 on hidden states) and 8-bit by more, for
+    /// reasons that have nothing to do with this code. Running it anyway
+    /// produced 271 failures that read exactly like a broken port.
+    static func fullPrecisionModelDir() throws -> URL {
+        let dir = try modelDir()
+        let weights = try loadArrays(url: dir.appendingPathComponent("model.safetensors"))
+        guard weights.values.allSatisfy({ $0.dtype == .float32 }) else {
+            throw XCTSkip(
+                "parity needs the float32 checkpoint the fixture was dumped from; "
+                    + "DIA2_MODEL_DIR holds converted weights")
+        }
+        return dir
     }
 
     func assertParity(_ got: MLXArray, _ ref: MLXArray, tol: Float, _ label: String,
@@ -39,7 +59,7 @@ final class Dia2ParityTests: XCTestCase {
 
     func testTransformerMatchesTheReference() throws {
         let fx = try Self.fixture()
-        let dir = try Self.modelDir()
+        let dir = try Self.fullPrecisionModelDir()
         let config = try JSONDecoder().decode(
             Dia2Config.self, from: Data(contentsOf: dir.appendingPathComponent("config.json")))
         let model = Dia2Transformer(config: config)
@@ -58,7 +78,7 @@ final class Dia2ParityTests: XCTestCase {
     }
     func testDepformerMatchesTheReference() throws {
         let fx = try Self.fixture()
-        let dir = try Self.modelDir()
+        let dir = try Self.fullPrecisionModelDir()
         let config = try JSONDecoder().decode(
             Dia2Config.self, from: Data(contentsOf: dir.appendingPathComponent("config.json")))
 
