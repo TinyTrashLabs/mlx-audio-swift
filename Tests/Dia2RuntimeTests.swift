@@ -57,6 +57,88 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertNil(config.assets)
     }
 
+    /// Dia2's upstream config is the model config itself, not a Transformers
+    /// wrapper with a root `model_type`. The public factory must still route a
+    /// local converted checkpoint to Dia2 rather than reject it before load.
+    func testTTSFactoryRoutesNestedDia2ConfigToLocalLoader() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nested-config-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.copyItem(
+            at: Self.fixtureURL("config-2b.json"),
+            to: directory.appendingPathComponent("config.json"))
+
+        do {
+            _ = try await TTS.loadModel(modelRepo: directory.path)
+            XCTFail("an incomplete fixture must fail after factory dispatch")
+        } catch let error as TTSModelError {
+            XCTFail("factory rejected a valid Dia2 config instead of invoking its loader: \(error)")
+        } catch {
+            // Expected: the tiny fixture has config only, so the Dia2 loader
+            // reaches its missing tokenizer/weights after successful dispatch.
+        }
+    }
+
+    /// Prefix frames condition the KV cache but are not part of generated
+    /// output unless a caller explicitly asks to retain them.
+    func testGeneratedOutputWindowExcludesConditioningPrefixFrames() {
+        XCTAssertFalse(Dia2OutputWindow.shouldEmit(outputIndex: 17, prefixFrames: 18))
+        XCTAssertTrue(Dia2OutputWindow.shouldEmit(outputIndex: 18, prefixFrames: 18))
+        XCTAssertTrue(Dia2OutputWindow.shouldEmit(outputIndex: 0, prefixFrames: 0))
+    }
+
+    /// Suppressed prefix PCM still has to pass through Mimi so its streaming
+    /// decoder state is warm when the first generated continuation arrives.
+    func testConditioningFramesDecodeWithoutBeingEmitted() {
+        XCTAssertFalse(Dia2OutputWindow.shouldDecode(outputIndex: -1))
+        XCTAssertTrue(Dia2OutputWindow.shouldDecode(outputIndex: 0))
+        XCTAssertFalse(Dia2OutputWindow.shouldEmit(outputIndex: 0, prefixFrames: 18))
+    }
+
+    /// Prefix transcript entries describe suppressed audio and must not be
+    /// returned as timestamps attached to the generated continuation.
+    func testGeneratedTranscriptStartsAfterConditioningWords() {
+        XCTAssertEqual(Dia2OutputWindow.firstGeneratedWordIndex(prefixWordCount: 6), 6)
+        XCTAssertEqual(Dia2OutputWindow.firstGeneratedWordIndex(prefixWordCount: 0), 0)
+    }
+
+    /// Warm-up teacher-forces one new-word per scheduled frame, but a forced
+    /// new-word is padded away while an earlier word's tokens are still
+    /// pending, and two words can round onto the same frame. Either way the
+    /// prefix ends with entries unconsumed — and an unconsumed prefix entry is
+    /// spoken as the opening of the generated turn, which is how a reference
+    /// clip's own last words end up in the take.
+    func testUnconsumedPrefixEntriesAreDrainedBeforeGeneration() {
+        let ids = Dia2TokenIDs(card: 0, newWord: 2, pad: 3, bos: 1, zero: 7,
+                               spk1: 10, spk2: 11, audioPad: 2049, audioBos: 2048)
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 6, initialPadding: 0)
+        let prefix = [
+            Dia2Entry(tokens: [20, 21, 22], text: "usually", padding: 0),
+            Dia2Entry(tokens: [23], text: "right", padding: 0),
+            Dia2Entry(tokens: [24], text: "that one", padding: 0),
+        ]
+        let state = machine.newState(entries: prefix + [
+            Dia2Entry(tokens: [30], text: "Good", padding: 0),
+        ])
+
+        // Three consecutive forced new-words: the first consumes "usually" and
+        // leaves three tokens pending, so the next two are swallowed.
+        for step in 0 ..< 3 {
+            _ = machine.process(step: step, state: state, token: ids.newWord, isForced: true)
+        }
+        XCTAssertEqual(state.head, 1, "the swallowed new-words left the prefix unconsumed")
+
+        state.drainPrefix(through: prefix.count, at: 3)
+
+        XCTAssertEqual(state.head, prefix.count,
+                       "generation must begin on the script, not the reference's tail")
+        XCTAssertEqual(state.transcript.map(\.0), ["usually", "right", "that one"],
+                       "drained words still count as prefix, so their timings are skipped")
+        XCTAssertFalse(state.hasPending, "stale prefix tokens would be emitted as text")
+    }
+
     func testZeroBOSTokenFallsBackToOneLikeTheReference() {
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(nil), 1)
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(0), 1)
@@ -446,12 +528,38 @@ final class Dia2RuntimeTests: XCTestCase {
             Dia2Word(text: "hello", start: 0.0, end: 0.4),
             Dia2Word(text: "there", start: 1.0, end: 1.4),
         ]
-        let entries = Dia2Prefix.entries(for: words, speakerToken: makeIDs().spk1,
-                                         tokenizer: FakeTokenizer(), frameRate: 12.5)
+        let (entries, _) = Dia2Prefix.entries(for: words, speakerToken: makeIDs().spk1,
+                                              tokenizer: FakeTokenizer(), frameRate: 12.5)
         XCTAssertEqual(entries.map(\.text), ["hello", "there"])
         XCTAssertEqual(entries[0].tokens.first, makeIDs().spk1)
         // 1.0s gap at 12.5 Hz is ~12 frames; the first entry must hold that long.
         XCTAssertGreaterThan(entries[0].padding, 5)
+    }
+
+    /// The reference derives each forced new-word from the same clamped start
+    /// it uses to schedule the word. Recomputing it from the raw timing drops
+    /// the clamp, so words that start inside the previous word's tokens get
+    /// forced onto a frame where `enforce` pads them away — the prefix text
+    /// then stops matching the prefix audio.
+    func testNewWordStepsClearThePreviousWordsTokens() {
+        // Three words 0.08s apart: at 12.5 Hz every raw start rounds to frame
+        // 0 or 1, so an unclamped schedule collapses them onto one another.
+        let words = [
+            Dia2Word(text: "one", start: 0.0, end: 0.05),
+            Dia2Word(text: "two", start: 0.08, end: 0.13),
+            Dia2Word(text: "three", start: 0.16, end: 0.21),
+        ]
+        let (entries, steps) = Dia2Prefix.entries(for: words, speakerToken: makeIDs().spk1,
+                                                  tokenizer: FakeTokenizer(), frameRate: 12.5)
+
+        XCTAssertEqual(steps.count, entries.count, "every word needs its own force")
+        XCTAssertEqual(Set(steps).count, steps.count, "two words must not share a frame")
+        XCTAssertEqual(steps, steps.sorted(), "forces must advance with the audio")
+        for (index, step) in steps.enumerated().dropFirst() {
+            let previous = entries[index - 1]
+            XCTAssertGreaterThanOrEqual(step, steps[index - 1] + previous.tokens.count,
+                                        "a force landing inside the previous word's tokens is padded away")
+        }
     }
 
     func testNoPrefixWhenSpeakerOneIsAbsent() throws {
