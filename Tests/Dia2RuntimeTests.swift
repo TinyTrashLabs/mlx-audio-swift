@@ -88,6 +88,21 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertTrue(Dia2OutputWindow.shouldEmit(outputIndex: 0, prefixFrames: 0))
     }
 
+    /// Suppressed prefix PCM still has to pass through Mimi so its streaming
+    /// decoder state is warm when the first generated continuation arrives.
+    func testConditioningFramesDecodeWithoutBeingEmitted() {
+        XCTAssertFalse(Dia2OutputWindow.shouldDecode(outputIndex: -1))
+        XCTAssertTrue(Dia2OutputWindow.shouldDecode(outputIndex: 0))
+        XCTAssertFalse(Dia2OutputWindow.shouldEmit(outputIndex: 0, prefixFrames: 18))
+    }
+
+    /// Prefix transcript entries describe suppressed audio and must not be
+    /// returned as timestamps attached to the generated continuation.
+    func testGeneratedTranscriptStartsAfterConditioningWords() {
+        XCTAssertEqual(Dia2OutputWindow.firstGeneratedWordIndex(prefixWordCount: 6), 6)
+        XCTAssertEqual(Dia2OutputWindow.firstGeneratedWordIndex(prefixWordCount: 0), 0)
+    }
+
     func testZeroBOSTokenFallsBackToOneLikeTheReference() {
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(nil), 1)
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(0), 1)

@@ -183,7 +183,11 @@ enum Dia2Loop {
         }
 
         var eosCutoff: Int?
-        var emittedWords = 0
+        // Prefix entries are teacher-forced into `state.transcript` during
+        // warm-up. Their PCM is conditioning, not generated output, so their
+        // timestamps must be skipped alongside that PCM.
+        var emittedWords = Dia2OutputWindow.firstGeneratedWordIndex(
+            prefixWordCount: state.transcript.count)
 
         for offset in 0 ..< cfg.runtime.maxContextSteps {
             let t = startStep + offset
@@ -255,21 +259,27 @@ enum Dia2Loop {
             // per codebook at its own offset — a raw column would mix codebooks
             // from up to maxDelay different frames.
             let readyIndex = t - maxDelay
-            if Dia2OutputWindow.shouldEmit(
-                outputIndex: readyIndex,
-                prefixFrames: prefix?.alignedFrames ?? 0
-            ) {
+            if Dia2OutputWindow.shouldDecode(outputIndex: readyIndex) {
                 let frame = Dia2Grid.frame(audioBuf, outputIndex: readyIndex, delays: delays)
                 let pcm = decoder.decodeFrames(frame.expandedDimensions(axis: 0))
                 eval(pcm)
-                let samples = pcm.reshaped([-1]).asArray(Float.self)
-                var words: [(String, Double)] = []
-                while emittedWords < state.transcript.count {
-                    let (text, step) = state.transcript[emittedWords]
-                    words.append((text, Double(step) / runtime.mimi.frameRate))
-                    emittedWords += 1
+                // Conditioning frames still pass through Mimi so its streaming
+                // convolution state is warm at the generated boundary. Only
+                // the output write is suppressed; skipping decode itself makes
+                // the continuation begin with a conspicuous cold-start burst.
+                if Dia2OutputWindow.shouldEmit(
+                    outputIndex: readyIndex,
+                    prefixFrames: prefix?.alignedFrames ?? 0
+                ) {
+                    let samples = pcm.reshaped([-1]).asArray(Float.self)
+                    var words: [(String, Double)] = []
+                    while emittedWords < state.transcript.count {
+                        let (text, step) = state.transcript[emittedWords]
+                        words.append((text, Double(step) / runtime.mimi.frameRate))
+                        emittedWords += 1
+                    }
+                    emit(Dia2Chunk(samples: samples, words: words))
                 }
-                emit(Dia2Chunk(samples: samples, words: words))
             }
 
             // Only start the flush countdown once no more text can arrive.
@@ -282,8 +292,16 @@ enum Dia2Loop {
 }
 
 enum Dia2OutputWindow {
+    static func shouldDecode(outputIndex: Int) -> Bool {
+        outputIndex >= 0
+    }
+
     static func shouldEmit(outputIndex: Int, prefixFrames: Int) -> Bool {
         outputIndex >= prefixFrames
+    }
+
+    static func firstGeneratedWordIndex(prefixWordCount: Int) -> Int {
+        prefixWordCount
     }
 }
 
