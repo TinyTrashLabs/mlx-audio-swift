@@ -7,9 +7,14 @@ on:
   pull_request:
     branches:
       - main
+      - staging
 
 jobs:
   tests:
+    # Hosted macOS minutes are expensive, so feature branches do not get a
+    # cloud run. Everything is verified locally first; CI is the gate on the
+    # promotion branches only.
+    if: github.head_ref == 'staging' || github.head_ref == 'main'
     runs-on: macos-latest
 
     steps:
