@@ -528,12 +528,38 @@ final class Dia2RuntimeTests: XCTestCase {
             Dia2Word(text: "hello", start: 0.0, end: 0.4),
             Dia2Word(text: "there", start: 1.0, end: 1.4),
         ]
-        let entries = Dia2Prefix.entries(for: words, speakerToken: makeIDs().spk1,
-                                         tokenizer: FakeTokenizer(), frameRate: 12.5)
+        let (entries, _) = Dia2Prefix.entries(for: words, speakerToken: makeIDs().spk1,
+                                              tokenizer: FakeTokenizer(), frameRate: 12.5)
         XCTAssertEqual(entries.map(\.text), ["hello", "there"])
         XCTAssertEqual(entries[0].tokens.first, makeIDs().spk1)
         // 1.0s gap at 12.5 Hz is ~12 frames; the first entry must hold that long.
         XCTAssertGreaterThan(entries[0].padding, 5)
+    }
+
+    /// The reference derives each forced new-word from the same clamped start
+    /// it uses to schedule the word. Recomputing it from the raw timing drops
+    /// the clamp, so words that start inside the previous word's tokens get
+    /// forced onto a frame where `enforce` pads them away — the prefix text
+    /// then stops matching the prefix audio.
+    func testNewWordStepsClearThePreviousWordsTokens() {
+        // Three words 0.08s apart: at 12.5 Hz every raw start rounds to frame
+        // 0 or 1, so an unclamped schedule collapses them onto one another.
+        let words = [
+            Dia2Word(text: "one", start: 0.0, end: 0.05),
+            Dia2Word(text: "two", start: 0.08, end: 0.13),
+            Dia2Word(text: "three", start: 0.16, end: 0.21),
+        ]
+        let (entries, steps) = Dia2Prefix.entries(for: words, speakerToken: makeIDs().spk1,
+                                                  tokenizer: FakeTokenizer(), frameRate: 12.5)
+
+        XCTAssertEqual(steps.count, entries.count, "every word needs its own force")
+        XCTAssertEqual(Set(steps).count, steps.count, "two words must not share a frame")
+        XCTAssertEqual(steps, steps.sorted(), "forces must advance with the audio")
+        for (index, step) in steps.enumerated().dropFirst() {
+            let previous = entries[index - 1]
+            XCTAssertGreaterThanOrEqual(step, steps[index - 1] + previous.tokens.count,
+                                        "a force landing inside the previous word's tokens is padded away")
+        }
     }
 
     func testNoPrefixWhenSpeakerOneIsAbsent() throws {
