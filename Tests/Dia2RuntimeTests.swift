@@ -57,6 +57,37 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertNil(config.assets)
     }
 
+    /// Dia2's upstream config is the model config itself, not a Transformers
+    /// wrapper with a root `model_type`. The public factory must still route a
+    /// local converted checkpoint to Dia2 rather than reject it before load.
+    func testTTSFactoryRoutesNestedDia2ConfigToLocalLoader() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nested-config-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.copyItem(
+            at: Self.fixtureURL("config-2b.json"),
+            to: directory.appendingPathComponent("config.json"))
+
+        do {
+            _ = try await TTS.loadModel(modelRepo: directory.path)
+            XCTFail("an incomplete fixture must fail after factory dispatch")
+        } catch let error as TTSModelError {
+            XCTFail("factory rejected a valid Dia2 config instead of invoking its loader: \(error)")
+        } catch {
+            // Expected: the tiny fixture has config only, so the Dia2 loader
+            // reaches its missing tokenizer/weights after successful dispatch.
+        }
+    }
+
+    /// Prefix frames condition the KV cache but are not part of generated
+    /// output unless a caller explicitly asks to retain them.
+    func testGeneratedOutputWindowExcludesConditioningPrefixFrames() {
+        XCTAssertFalse(Dia2OutputWindow.shouldEmit(outputIndex: 17, prefixFrames: 18))
+        XCTAssertTrue(Dia2OutputWindow.shouldEmit(outputIndex: 18, prefixFrames: 18))
+        XCTAssertTrue(Dia2OutputWindow.shouldEmit(outputIndex: 0, prefixFrames: 0))
+    }
+
     func testZeroBOSTokenFallsBackToOneLikeTheReference() {
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(nil), 1)
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(0), 1)

@@ -255,7 +255,10 @@ enum Dia2Loop {
             // per codebook at its own offset — a raw column would mix codebooks
             // from up to maxDelay different frames.
             let readyIndex = t - maxDelay
-            if readyIndex >= 0 {
+            if Dia2OutputWindow.shouldEmit(
+                outputIndex: readyIndex,
+                prefixFrames: prefix?.alignedFrames ?? 0
+            ) {
                 let frame = Dia2Grid.frame(audioBuf, outputIndex: readyIndex, delays: delays)
                 let pcm = decoder.decodeFrames(frame.expandedDimensions(axis: 0))
                 eval(pcm)
@@ -275,6 +278,12 @@ enum Dia2Loop {
                 if complete { eosCutoff = end + flushTail }
             }
         }
+    }
+}
+
+enum Dia2OutputWindow {
+    static func shouldEmit(outputIndex: Int, prefixFrames: Int) -> Bool {
+        outputIndex >= prefixFrames
     }
 }
 
