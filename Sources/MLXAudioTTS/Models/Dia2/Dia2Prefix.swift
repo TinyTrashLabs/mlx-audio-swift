@@ -129,6 +129,9 @@ public enum Dia2Prefix {
                 stepTokens[1, 1, 0] = MLXArray(Int32(ids.pad))
             }
         }
+        // Teacher-forcing does not guarantee every prefix entry was consumed;
+        // anything left would be spoken as the start of the generated turn.
+        state.drainPrefix(through: plan.entries.count, at: plan.alignedFrames)
         return max(plan.alignedFrames - 1, 0)
     }
 }

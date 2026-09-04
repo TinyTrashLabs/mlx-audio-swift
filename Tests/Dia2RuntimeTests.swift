@@ -103,6 +103,42 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertEqual(Dia2OutputWindow.firstGeneratedWordIndex(prefixWordCount: 0), 0)
     }
 
+    /// Warm-up teacher-forces one new-word per scheduled frame, but a forced
+    /// new-word is padded away while an earlier word's tokens are still
+    /// pending, and two words can round onto the same frame. Either way the
+    /// prefix ends with entries unconsumed — and an unconsumed prefix entry is
+    /// spoken as the opening of the generated turn, which is how a reference
+    /// clip's own last words end up in the take.
+    func testUnconsumedPrefixEntriesAreDrainedBeforeGeneration() {
+        let ids = Dia2TokenIDs(card: 0, newWord: 2, pad: 3, bos: 1, zero: 7,
+                               spk1: 10, spk2: 11, audioPad: 2049, audioBos: 2048)
+        let machine = Dia2StateMachine(tokenIDs: ids, secondStreamAhead: 0,
+                                       maxPadding: 6, initialPadding: 0)
+        let prefix = [
+            Dia2Entry(tokens: [20, 21, 22], text: "usually", padding: 0),
+            Dia2Entry(tokens: [23], text: "right", padding: 0),
+            Dia2Entry(tokens: [24], text: "that one", padding: 0),
+        ]
+        let state = machine.newState(entries: prefix + [
+            Dia2Entry(tokens: [30], text: "Good", padding: 0),
+        ])
+
+        // Three consecutive forced new-words: the first consumes "usually" and
+        // leaves three tokens pending, so the next two are swallowed.
+        for step in 0 ..< 3 {
+            _ = machine.process(step: step, state: state, token: ids.newWord, isForced: true)
+        }
+        XCTAssertEqual(state.head, 1, "the swallowed new-words left the prefix unconsumed")
+
+        state.drainPrefix(through: prefix.count, at: 3)
+
+        XCTAssertEqual(state.head, prefix.count,
+                       "generation must begin on the script, not the reference's tail")
+        XCTAssertEqual(state.transcript.map(\.0), ["usually", "right", "that one"],
+                       "drained words still count as prefix, so their timings are skipped")
+        XCTAssertFalse(state.hasPending, "stale prefix tokens would be emitted as text")
+    }
+
     func testZeroBOSTokenFallsBackToOneLikeTheReference() {
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(nil), 1)
         XCTAssertEqual(Dia2TokenIDs.resolvedBOS(0), 1)
