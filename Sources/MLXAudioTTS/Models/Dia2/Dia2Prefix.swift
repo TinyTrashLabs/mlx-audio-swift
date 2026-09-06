@@ -47,15 +47,25 @@ public enum Dia2Prefix {
     /// word's tokens are still pending. `enforce` pads those away, the text
     /// stream stops matching the audio being teacher-forced, and the speaker
     /// never binds to its voice.
+    /// - Parameter spk2Token: the `[S2]` id, so `speakerToken` can be named for
+    ///   the tokenizer. Defaults to nil, which reads every clip as `[S1]`.
     public static func entries(for words: [Dia2Word], speakerToken: Int,
                                tokenizer: any Dia2TextTokenizing,
-                               frameRate: Double) -> (entries: [Dia2Entry], newWordSteps: [Int]) {
+                               frameRate: Double,
+                               spk2Token: Int? = nil) -> (entries: [Dia2Entry], newWordSteps: [Int]) {
         var entries: [Dia2Entry] = []
         var newWordSteps: [Int] = []
         var current = 0
         for (index, word) in words.enumerated() {
+            // The reference encodes the first word together with its speaker
+            // tag -- `encode("[S1] We")` -- so the word keeps the leading space
+            // the BPE vocabulary expects after a tag. Encoding "We" on its own
+            // and inserting the tag in front yields a different, space-less
+            // token for every prefix's opening word. `Dia2ScriptParser` already
+            // does this correctly; the prefix path did not.
+            let tag = speakerToken == spk2Token ? "[S2]" : "[S1]"
             var tokens = index == 0
-                ? tokenizer.encode(word.text)
+                ? tokenizer.encode("\(tag) \(word.text)")
                 : tokenizer.encode(word.text)
             if index == 0, tokens.first != speakerToken { tokens.insert(speakerToken, at: 0) }
             let start = max(current + 1, Int((word.start * frameRate).rounded()))
@@ -87,7 +97,8 @@ public enum Dia2Prefix {
         }
 
         let first = entries(for: speaker1.words, speakerToken: runtime.tokenIDs.spk1,
-                            tokenizer: runtime.tokenizer, frameRate: runtime.mimi.frameRate)
+                            tokenizer: runtime.tokenizer, frameRate: runtime.mimi.frameRate,
+                            spk2Token: runtime.tokenIDs.spk2)
         var entries = first.entries
         var tokens = encode(speaker1)
         // Matches the reference's BOS/PAD offset before the first prefix word.
@@ -97,7 +108,8 @@ public enum Dia2Prefix {
             let frames = tokens.dim(1)
             let second = Self.entries(for: speaker2.words, speakerToken: runtime.tokenIDs.spk2,
                                       tokenizer: runtime.tokenizer,
-                                      frameRate: runtime.mimi.frameRate)
+                                      frameRate: runtime.mimi.frameRate,
+                                      spk2Token: runtime.tokenIDs.spk2)
             entries += second.entries
             steps += second.newWordSteps.map { $0 + frames }
             tokens = concatenated([tokens, encode(speaker2)], axis: 1)

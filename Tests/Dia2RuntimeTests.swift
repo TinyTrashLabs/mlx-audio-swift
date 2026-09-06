@@ -521,6 +521,53 @@ final class Dia2RuntimeTests: XCTestCase {
         })
         XCTAssertEqual(draws, Set([0, 1]))
     }
+    /// Records the exact strings it is asked to encode, so a test can assert
+    /// that the speaker tag and its word arrive as one string.
+    private final class RecordingTokenizer: Dia2TextTokenizing, @unchecked Sendable {
+        var seen: [String] = []
+        func encode(_ text: String) -> [Int] {
+            seen.append(text)
+            return text.unicodeScalars.map { Int($0.value) }
+        }
+    }
+
+    /// The reference encodes `"[S1] hello"` in one call so the word keeps the
+    /// leading space its BPE entry has. Encoding `"hello"` alone and inserting
+    /// the tag afterwards produces a different token for the opening word of
+    /// every conditioning clip, which is what the port used to do.
+    func testFirstPrefixWordIsEncodedWithItsSpeakerTag() {
+        let words = [
+            Dia2Word(text: "hello", start: 0.0, end: 0.4),
+            Dia2Word(text: "there", start: 1.0, end: 1.4),
+        ]
+        let ids = makeIDs()
+        let tokenizer = RecordingTokenizer()
+        _ = Dia2Prefix.entries(for: words, speakerToken: ids.spk1, tokenizer: tokenizer,
+                               frameRate: 12.5, spk2Token: ids.spk2)
+        XCTAssertEqual(tokenizer.seen, ["[S1] hello", "there"])
+
+        let second = RecordingTokenizer()
+        _ = Dia2Prefix.entries(for: words, speakerToken: ids.spk2, tokenizer: second,
+                               frameRate: 12.5, spk2Token: ids.spk2)
+        XCTAssertEqual(second.seen, ["[S2] hello", "there"])
+    }
+
+    /// Generation starts at the prefix's last frame and runs `maxContextSteps`
+    /// more, so the table has to cover `prefixFrames + maxContextSteps`. Sized
+    /// to `maxContextSteps + 64`, a 441-frame (35s) prefix ran out of table
+    /// ~90s into a pass, and MLX reads an over-long gather straight off the end
+    /// of the buffer rather than clamping it.
+    func testRoPETableCoversTheLongestPrefixPlusAFullContext() {
+        let contextSteps = 1500
+        let rows = Dia2RoPE.tableRows(forContextSteps: contextSteps)
+        // A prefix can be at most the model's whole context.
+        let worstCaseHighestPosition = contextSteps + contextSteps
+        XCTAssertGreaterThan(rows, worstCaseHighestPosition)
+        // The sizing that shipped the bug, kept here so it cannot come back.
+        XCTAssertLessThan(contextSteps + 64, 441 + contextSteps,
+                          "the old sizing did not cover a 441-frame prefix")
+    }
+
     /// Word timings become entries whose padding spans the gap to the next
     /// word, so the model is taught this speaker's actual rhythm.
     func testWordsBecomeEntriesWithGapPadding() {
