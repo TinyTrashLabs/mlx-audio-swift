@@ -122,7 +122,12 @@ public enum Dia2Prefix {
 
         func encode(_ input: Dia2PrefixInput) -> MLXArray {
             let wave = MLXArray(input.samples).reshaped([1, 1, input.samples.count])
-            return runtime.mimi.encode(wave)[0].asType(.int32)   // [C, T]
+            let tokens = runtime.mimi.encode(wave)[0].asType(.int32)   // [C, T]
+            // Materialise here. Nothing downstream reads these as scalars, so
+            // without an eval the whole clip's Mimi encoder graph rides into
+            // the generation loop's first eval (~4.6 GB per reference clip).
+            eval(tokens)
+            return tokens
         }
 
         let first = entries(for: speaker1.words, speakerToken: runtime.tokenIDs.spk1,
@@ -180,6 +185,15 @@ public enum Dia2Prefix {
             }
             let positions = repeated(MLXArray([Int32(t)]).reshaped([1, 1]), count: branches, axis: 0)
             _ = runtime.transformer.step(stepTokens, positions: positions, cache: cache)
+            // Force this frame's work NOW. The state machine works in plain
+            // Ints, so warm-up has no evaluation point of its own: without this
+            // the entire prefix accumulates as ONE lazy graph and lands in a
+            // single burst at the first generated token (a 638-frame prefix ->
+            // ~7.5 GB live peak and ~9.8 GB stranded in MLX's buffer-reuse
+            // pool, which macOS then swaps). The generation loop is exempt
+            // because Dia2Sampler.sample ends in .item(); evaluating the cache
+            // arrays materialises the KV state incrementally instead.
+            eval(cache.flatMap { $0.innerState() } + [stepTokens])
 
             let forced = forcedSteps.contains(t) ? ids.newWord : ids.pad
             let processed = machine.process(step: t, state: state, token: forced, isForced: true)
