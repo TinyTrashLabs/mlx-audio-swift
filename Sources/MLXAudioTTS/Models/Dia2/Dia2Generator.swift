@@ -32,6 +32,16 @@ public struct Dia2GenerationConfig: Sendable {
     /// waveform, so it drops the pitch with the pace and the voice sounds
     /// wrong; padding changes only how long the model waits between words.
     public var maxPadding: Int?
+    /// Seed for this generation. mlx-swift seeds its global RNG from
+    /// `DispatchTime.now()` at process start, so every render is a different
+    /// draw and no before/after comparison of two renders proves anything.
+    /// Setting this makes a take reproducible: same seed, same script, same
+    /// prefix -> bit-identical samples. nil keeps the process-wide draw.
+    ///
+    /// Seeding is global, not per-session: two Dia2 generations running at the
+    /// same time in one process will interleave their draws. The app renders
+    /// passes one at a time, which is what makes this sound.
+    public var seed: UInt64?
     public init() {}
 
     public func effectiveInitialPadding(for config: Dia2Config) -> Int {
@@ -161,18 +171,36 @@ enum Dia2Loop {
         let depCache = runtime.depformer.makeCache()
         let decoder = MimiStreamingDecoder(runtime.mimi)
 
-        var startStep = 0
-        if let prefix {
-            startStep = try Dia2Prefix.warmUp(prefix, runtime: runtime, machine: machine,
-                                              state: state, cache: transformerCache,
-                                              branches: branches)
-        }
+        // Before the first draw, and before warm-up so a re-roll changes
+        // nothing but the sampling.
+        if let seed = genConfig.seed { MLXRandom.seed(seed) }
 
+        // Built BEFORE warm-up and handed to it, so the prefix and the
+        // generation that continues it share one buffer -- see
+        // `Dia2Prefix.warmUp`. The reference's `build_initial_state` does the
+        // same, and the two divergences that came of not doing it (PAD on the
+        // prefix's first frame, BOS on generation's) both land exactly where a
+        // conditioned voice is won or lost.
         // step tokens: [branches, channels, 1]
         var stepTokens = MLXArray.full([branches, channels, 1],
                                        values: MLXArray(Int32(ids.pad)), type: Int32.self)
         stepTokens[0, 0, 0] = MLXArray(Int32(ids.bos))
         if branches > 1 { stepTokens[1, 0, 0] = MLXArray(Int32(ids.zero)) }
+
+        var startStep = 0
+        if let prefix {
+            startStep = try Dia2Prefix.warmUp(prefix, runtime: runtime, machine: machine,
+                                              state: state, cache: transformerCache,
+                                              branches: branches, stepTokens: stepTokens)
+        }
+        if ProcessInfo.processInfo.environment["DIA2_TRACE"] != nil {
+            Dia2Trace.call += 1
+            let head = "[dia2 trace] call \(Dia2Trace.call): "
+                + "prefixFrames=\(prefix?.alignedFrames ?? 0) startStep=\(startStep) "
+                + "entriesPending=\(state.entries.count) transcript=\(state.transcript.count) "
+                + "forcedSteps=\(prefix?.newWordSteps.count ?? 0)\n"
+            FileHandle.standardError.write(Data(head.utf8))
+        }
 
         let totalSteps = cfg.runtime.maxContextSteps + startStep + 1
         var audioBuf = MLXArray.full([audioChannels, totalSteps],
@@ -275,7 +303,17 @@ enum Dia2Loop {
                     var words: [(String, Double)] = []
                     while emittedWords < state.transcript.count {
                         let (text, step) = state.transcript[emittedWords]
-                        words.append((text, Double(step) / runtime.mimi.frameRate))
+                        // Rebase onto the audio actually returned. `step` counts
+                        // from the start of the prefix, but the prefix's frames
+                        // are conditioning and are never emitted, so a raw step
+                        // put every word of a 638-frame-prefix take 51 seconds
+                        // past the end of its own audio. Anything measuring a
+                        // span off these timings -- slicing one speaker out of a
+                        // take, trimming the flush tail, or handing the tail
+                        // back as the next pass's conditioning -- silently got
+                        // nothing.
+                        let emitted = Double(step - (prefix?.alignedFrames ?? 0))
+                        words.append((text, max(0, emitted) / runtime.mimi.frameRate))
                         emittedWords += 1
                     }
                     emit(Dia2Chunk(samples: samples, words: words))
@@ -284,11 +322,23 @@ enum Dia2Loop {
 
             // Only start the flush countdown once no more text can arrive.
             if eosCutoff == nil, let end = state.endStep {
+                if ProcessInfo.processInfo.environment["DIA2_TRACE"] != nil,
+                   Dia2Trace.endReported != Dia2Trace.call {
+                    Dia2Trace.endReported = Dia2Trace.call
+                    let line = "[dia2 trace] call \(Dia2Trace.call): endStep=\(end) at t=\(t), "
+                        + "entriesLeft=\(state.entries.count), spoken=\(state.transcript.count)\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
                 let complete = RunLoopBridge.blockingIsComplete(isComplete)
                 if complete { eosCutoff = end + flushTail }
             }
         }
     }
+}
+
+enum Dia2Trace {
+    nonisolated(unsafe) static var call = 0
+    nonisolated(unsafe) static var endReported = -1
 }
 
 enum Dia2OutputWindow {

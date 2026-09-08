@@ -552,6 +552,42 @@ final class Dia2RuntimeTests: XCTestCase {
         XCTAssertEqual(second.seen, ["[S2] hello", "there"])
     }
 
+    /// A continuation prefix is the tail of the previous pass: one contiguous
+    /// clip with BOTH voices in it. Every turn after a speaker change needs its
+    /// own tag, exactly as a script gets one -- without them the clip reads as
+    /// one long monologue and the exchange it is meant to carry forward is
+    /// lost.
+    func testMixedSpeakerPrefixTagsEveryTurn() {
+        let words = [
+            Dia2Word(text: "hello", start: 0.0, end: 0.4, speaker: 1),
+            Dia2Word(text: "there", start: 1.0, end: 1.4, speaker: 1),
+            Dia2Word(text: "hi", start: 2.0, end: 2.4, speaker: 2),
+            Dia2Word(text: "back", start: 3.0, end: 3.4, speaker: 2),
+            Dia2Word(text: "right", start: 4.0, end: 4.4, speaker: 1),
+        ]
+        let ids = makeIDs()
+        let tokenizer = RecordingTokenizer()
+        _ = Dia2Prefix.entries(for: words, speakerToken: ids.spk1, tokenizer: tokenizer,
+                               frameRate: 12.5, spk2Token: ids.spk2, spk1Token: ids.spk1)
+        XCTAssertEqual(tokenizer.seen, ["[S1] hello", "there", "[S2] hi", "back", "[S1] right"])
+    }
+
+    /// A single-voice reference leaves `speaker` nil throughout, and must keep
+    /// behaving exactly as it did before mixed clips were possible: one tag, on
+    /// the opening word, and nothing else.
+    func testSingleSpeakerPrefixIsUnchangedByTheMixedPath() {
+        let words = [
+            Dia2Word(text: "hello", start: 0.0, end: 0.4),
+            Dia2Word(text: "there", start: 1.0, end: 1.4),
+            Dia2Word(text: "again", start: 2.0, end: 2.4),
+        ]
+        let ids = makeIDs()
+        let tokenizer = RecordingTokenizer()
+        _ = Dia2Prefix.entries(for: words, speakerToken: ids.spk2, tokenizer: tokenizer,
+                               frameRate: 12.5, spk2Token: ids.spk2, spk1Token: ids.spk1)
+        XCTAssertEqual(tokenizer.seen, ["[S2] hello", "there", "again"])
+    }
+
     /// Generation starts at the prefix's last frame and runs `maxContextSteps`
     /// more, so the table has to cover `prefixFrames + maxContextSteps`. Sized
     /// to `maxContextSteps + 64`, a 441-frame (35s) prefix ran out of table
