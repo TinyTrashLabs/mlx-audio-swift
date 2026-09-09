@@ -101,13 +101,21 @@ public enum Qwen3TTSFusedBench {
             let wasRope = Qwen3TTSModel.fastRope, wasFused = Qwen3TTSModel.fusedLayers, wasMode = Qwen3TTSFusedStep.mode
             Qwen3TTSModel.fastRope = true
             for _ in 0 ..< 2 {
+                // Chained (each step feeds the next), like the real loop: a
+                // dependent chain pays every launch's latency in full, where
+                // independent steps would pipeline and flatter every path.
+                func chained() -> [MLXArray] {
+                    var h = x
+                    for _ in 0 ..< ops { h = layer(h, positionEmbeddings: (h, h), mask: nil, cache: nil) }
+                    return [h]
+                }
                 Qwen3TTSModel.fusedLayers = false
-                timed("layer step: module path") { (0 ..< ops).map { _ in layer(x, positionEmbeddings: (x, x), mask: nil, cache: nil) } }
+                timed("layer step chained: module path", chained)
                 Qwen3TTSModel.fusedLayers = true
                 Qwen3TTSFusedStep.mode = .hybrid
-                timed("layer step: hybrid") { (0 ..< ops).map { _ in layer(x, positionEmbeddings: (x, x), mask: nil, cache: nil) } }
+                timed("layer step chained: hybrid", chained)
                 Qwen3TTSFusedStep.mode = .customMatvec
-                timed("layer step: custom matvec") { (0 ..< ops).map { _ in layer(x, positionEmbeddings: (x, x), mask: nil, cache: nil) } }
+                timed("layer step chained: custom matvec", chained)
             }
             Qwen3TTSModel.fastRope = wasRope; Qwen3TTSModel.fusedLayers = wasFused; Qwen3TTSFusedStep.mode = wasMode
         } catch {
