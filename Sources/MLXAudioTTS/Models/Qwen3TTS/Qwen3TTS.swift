@@ -27,6 +27,30 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     public var sampleRate: Int { config.sampleRate }
 
+    /// Loop profiling (iOS speed spike, 2026-09-08). When on, the generation
+    /// loop forces an eval at each stage boundary and accumulates wall time
+    /// per stage in `loopProfile` (seconds) plus `loopProfileFrames`. Costs a
+    /// little throughput itself, so leave it off in production.
+    public nonisolated(unsafe) static var profileLoop = false
+    /// Code-predictor step strategy: 0 = KV cache (upstream), 1 = cache-free
+    /// eager over the prefix, 2 = cache-free compiled with the module as
+    /// compile state, 3 = cache-free compiled with the weights captured as
+    /// constants (see `Qwen3TTSCodePredictor.compiledLogits`). 0 until measured.
+    public nonisolated(unsafe) static var codePredictorMode = 0
+    /// Rotate q/k with MLXFast.RoPE (one kernel each) instead of the
+    /// slice/negate/concat/multiply/add chain. Equivalent for this model.
+    public nonisolated(unsafe) static var fastRope = false
+    /// Skip the every-50-steps Metal cache flush inside the loop (the caller
+    /// bounds the cache with `Memory.cacheLimit` anyway).
+    public nonisolated(unsafe) static var skipLoopCacheClear = false
+    /// Greedy (argmax) sub-codebooks 1…15; only the first codebook samples.
+    public nonisolated(unsafe) static var greedySubCodes = false
+    public nonisolated(unsafe) static var loopProfile: [String: Double] = [:]
+    public nonisolated(unsafe) static var loopProfileFrames = 0
+    private static func profileAdd(_ key: String, _ seconds: Double) {
+        loopProfile[key, default: 0] += seconds
+    }
+
     public var defaultGenerationParameters: GenerateParameters {
         GenerateParameters(
             maxTokens: 4096,
@@ -470,10 +494,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             }
         }
 
+        let profiling = Self.profileLoop
+        if profiling { Self.loopProfile = [:]; Self.loopProfileFrames = 0 }
         for step in 0 ..< effectiveMaxTokens {
             try Task.checkCancellation()
+            var stageStart = Date()
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
+            if profiling { eval(logits, hidden); Self.profileAdd("talker", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Sample first codebook token
             let nextToken = sampleToken(
@@ -488,6 +516,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 minP: minP
             )
 
+            if profiling { eval(nextToken); Self.profileAdd("sample0", Date().timeIntervalSince(stageStart)); stageStart = Date() }
+
             // Defer sync to the eval boundary with inputEmbeds.
             let isEOS = nextToken .== eosTokenArray
 
@@ -498,6 +528,29 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 _ = layerCache.trim(layerCache.offset)
             }
 
+            if Self.codePredictorMode > 0 {
+                // Prefix grows by one embedding per step; each step is one
+                // compiled graph over the whole (tiny) prefix.
+                var prefix = concatenated([codeHidden, talker.getInputEmbeddings()(nextToken)], axis: 1)
+                for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
+                    if codeIdx > 0 {
+                        prefix = concatenated(
+                            [prefix, talker.codePredictor.codecEmbedding[codeIdx - 1](codeTokens.last!)], axis: 1)
+                    }
+                    let codeLogits = Self.codePredictorMode >= 2
+                        ? talker.codePredictor.compiledLogits(prefix: prefix, step: codeIdx,
+                                                              withState: Self.codePredictorMode == 2)
+                        : talker.codePredictor.logitsNoCache(prefix: prefix, step: codeIdx)
+                    let nextCode = sampleToken(
+                        codeLogits,
+                        temperature: Self.greedySubCodes ? 0 : temperature,
+                        topP: topP,
+                        topK: topK,
+                        minP: minP
+                    )
+                    codeTokens.append(nextCode)
+                }
+            } else {
             for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
                 let codeInput: MLXArray
                 if codeIdx == 0 {
@@ -513,15 +566,17 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
                 let nextCode = sampleToken(
                     codeLogits,
-                    temperature: temperature,
+                    temperature: Self.greedySubCodes ? 0 : temperature,
                     topP: topP,
                     topK: topK,
                     minP: minP
                 )
                 codeTokens.append(nextCode)
             }
+            }
 
             let allCodes = concatenated(codeTokens, axis: 1) // [1, num_code_groups]
+            if profiling { eval(allCodes); Self.profileAdd("codePredictor", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Prepare next input
             let textEmbed: MLXArray
@@ -540,6 +595,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
             inputEmbeds = textEmbed + codecEmbed
             eval(inputEmbeds, isEOS)
+            if profiling { Self.profileAdd("nextInput", Date().timeIntervalSince(stageStart)); stageStart = Date(); Self.loopProfileFrames += 1 }
 
             let tokenId = Int(nextToken[0, 0].item(Int32.self))
             onToken?(tokenId)
@@ -559,13 +615,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
                     let audioChunk = decoded[0]
                     eval(audioChunk)
+                    if profiling { Self.profileAdd("decode", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
                     decodedTokens = generatedCodes.count
                     onAudioChunk(audioChunk)
                 }
             }
 
-            if step > 0, step % 50 == 0 {
+            if step > 0, step % 50 == 0, !Self.skipLoopCacheClear {
                 Memory.clearCache()
             }
         }

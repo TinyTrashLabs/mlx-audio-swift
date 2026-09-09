@@ -22,6 +22,13 @@ private func applyRotaryPosEmb(
     return (qEmbed, kEmbed)
 }
 
+/// Test seam for `applyRotaryPosEmb` (private above).
+func applyRotaryPosEmbForTest(
+    _ q: MLXArray, _ k: MLXArray, cos cosVal: MLXArray, sin sinVal: MLXArray
+) -> (MLXArray, MLXArray) {
+    applyRotaryPosEmb(q, k, cos: cosVal, sin: sinVal)
+}
+
 // MARK: - Compute inv_freq for RoPE
 
 private func computeInvFreq(dim: Int, base: Float) -> MLXArray {
@@ -129,6 +136,7 @@ final class TalkerAttention: Module {
     let numKvHeads: Int
     let headDim: Int
     let scale: Float
+    let ropeTheta: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -142,6 +150,7 @@ final class TalkerAttention: Module {
         self.numKvHeads = config.numKeyValueHeads
         self.headDim = config.headDim
         self.scale = 1.0 / Foundation.sqrt(Float(headDim))
+        self.ropeTheta = config.ropeTheta
 
         _qProj.wrappedValue = Linear(config.hiddenSize, numHeads * headDim, bias: config.attentionBias)
         _kProj.wrappedValue = Linear(config.hiddenSize, numKvHeads * headDim, bias: config.attentionBias)
@@ -170,8 +179,17 @@ final class TalkerAttention: Module {
         k = k.transposed(0, 2, 1, 3)
         v = v.transposed(0, 2, 1, 3)
 
-        let (cosVal, sinVal) = positionEmbeddings
-        (q, k) = applyRotaryPosEmb(q, k, cos: cosVal, sin: sinVal)
+        if Qwen3TTSModel.fastRope {
+            // One fused kernel per tensor instead of slice/negate/concat/
+            // multiply/add (≈7 launches each). With every position stream
+            // equal the interleaved M-RoPE reduces to plain rotate-half RoPE.
+            let offset = cache?.offset ?? 0
+            q = MLXFast.RoPE(q, dimensions: headDim, traditional: false, base: ropeTheta, scale: 1, offset: offset)
+            k = MLXFast.RoPE(k, dimensions: headDim, traditional: false, base: ropeTheta, scale: 1, offset: offset)
+        } else {
+            let (cosVal, sinVal) = positionEmbeddings
+            (q, k) = applyRotaryPosEmb(q, k, cos: cosVal, sin: sinVal)
+        }
 
         if let cache {
             (k, v) = cache.update(keys: k, values: v)
@@ -290,7 +308,9 @@ final class Qwen3TTSTalkerModel: Module {
             posIds = stacked([bpos, bpos, bpos], axis: 0)
         }
 
-        let posEmbeddings = rotaryEmb(inputsEmbeds, positionIds: posIds)
+        let posEmbeddings = Qwen3TTSModel.fastRope
+            ? (inputsEmbeds, inputsEmbeds)   // unused; the layers rotate in-kernel
+            : rotaryEmb(inputsEmbeds, positionIds: posIds)
 
         var causalMask = mask
         if causalMask == nil, seqLen > 1 {
