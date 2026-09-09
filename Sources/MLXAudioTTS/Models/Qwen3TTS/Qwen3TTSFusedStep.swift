@@ -63,6 +63,76 @@ enum Qwen3TTSFusedStep {
 
     static let headDim = 128
     static let chunk = 1024
+
+    /// `.hybrid` (default): MLX's quantized matmul for every projection, with
+    /// q/k/v and gate/up concatenated at load so each costs one launch, and
+    /// custom kernels only for the glue (head norm + RoPE + split, residual +
+    /// norm, silu·up) — ~12 launches per layer, all at the launch floor.
+    /// `.customMatvec`: the four hand-written matvec kernels (measured on the
+    /// iPhone 15 Pro at 2–4× MLX's matmul cost; kept for the bench).
+    enum Mode { case hybrid, customMatvec }
+    nonisolated(unsafe) static var mode: Mode = .hybrid
+
+    /// Concatenated projections, built once per layer (keyed by the q weight)
+    /// so one matmul launch serves q/k/v and one serves gate/up.
+    struct Concat { let qkvW: MLXArray, qkvS: MLXArray, qkvB: MLXArray, guW: MLXArray, guS: MLXArray, guB: MLXArray }
+    private nonisolated(unsafe) static var concats: [ObjectIdentifier: Concat] = [:]
+    private static let concatsLock = NSLock()
+
+    static func concat(for layer: Layer) -> Concat {
+        let key = ObjectIdentifier(layer.q.weight)
+        concatsLock.lock(); defer { concatsLock.unlock() }
+        if let c = concats[key] { return c }
+        let c = Concat(
+            qkvW: concatenated([layer.q.weight, layer.k.weight, layer.v.weight], axis: 0),
+            qkvS: concatenated([layer.q.scales, layer.k.scales, layer.v.scales], axis: 0),
+            qkvB: concatenated([layer.q.biases, layer.k.biases, layer.v.biases], axis: 0),
+            guW: concatenated([layer.gate.weight, layer.up.weight], axis: 0),
+            guS: concatenated([layer.gate.scales, layer.up.scales], axis: 0),
+            guB: concatenated([layer.gate.biases, layer.up.biases], axis: 0))
+        eval(c.qkvW, c.qkvS, c.qkvB, c.guW, c.guS, c.guB)
+        concats[key] = c
+        return c
+    }
+
+    private static func qmm(_ x: MLXArray, _ w: MLXArray, _ s: MLXArray, _ b: MLXArray) -> MLXArray {
+        quantizedMM(x, w, scales: s, biases: b, transpose: true, groupSize: 64, bits: 4, mode: .affine)
+    }
+
+    /// The hybrid step (see `Mode`).
+    static func runHybrid(_ x: MLXArray, layer: Layer, cache: (any KVCache)?) -> MLXArray {
+        let dtype = x.dtype
+        let paramType = layer.inputNorm.dtype
+        let hidden = x.dim(2)
+        let intermediate = layer.gate.scales.dim(0)
+        let (h, d) = (layer.numHeads, layer.numKvHeads)
+        let c = concat(for: layer)
+        let params = MLXArray([layer.eps, layer.ropeTheta])
+        let position = MLXArray([Int32(cache?.offset ?? 0)])
+
+        let normed = MLXFast.rmsNorm(x, weight: layer.inputNorm, eps: layer.eps)
+        let qkv = qmm(normed, c.qkvW, c.qkvS, c.qkvB)                       // (1, 1, (h+2d)·128)
+        let split = kernel(.qkvPost, dtype: qkv.dtype, paramType: paramType, k: hidden, nt: 128, nq: h, nkv: d)(
+            [qkv, layer.qNorm, layer.kNorm, params, position],
+            grid: ((h + 2 * d) * 128, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, h, 1, headDim], [1, d, 1, headDim], [1, d, 1, headDim]],
+            outputDTypes: [dtype, dtype, dtype])
+        var (q, k, v) = (split[0], split[1], split[2])
+        if let cache { (k, v) = cache.update(keys: k, values: v) }
+        let attended = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: layer.scale, mask: nil)
+        let o = qmm(attended.reshaped(1, 1, h * headDim).asType(dtype), layer.o.weight, layer.o.scales, layer.o.biases)
+        let addNorm = kernel(.addNorm, dtype: dtype, paramType: paramType, k: hidden, nt: 256, xType: o.dtype)(
+            [x, o, layer.postNorm, params],
+            grid: (256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1, hidden], [1, 1, hidden]], outputDTypes: [dtype, dtype])
+        let (afterAttention, postNormed) = (addNorm[0], addNorm[1])
+        let gu = qmm(postNormed, c.guW, c.guS, c.guB)                        // (1, 1, 2·intermediate)
+        let activated = kernel(.siluMul, dtype: gu.dtype, paramType: paramType, k: intermediate, nt: 256)(
+            [gu], grid: (intermediate, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1, intermediate]], outputDTypes: [gu.dtype])[0]
+        let down = qmm(activated, layer.down.weight, layer.down.scales, layer.down.biases)
+        return afterAttention + down
+    }
     /// Threads per group. qkv needs a whole head (128 rows) per group for
     /// the head norm, so it runs 32 simdgroups of 4 rows; the others run
     /// four simdgroups (16 rows) per group so enough groups are in flight.
@@ -74,6 +144,7 @@ enum Qwen3TTSFusedStep {
 
     /// `x` is (1, 1, hidden). Returns the layer output in the same shape.
     static func run(_ x: MLXArray, layer: Layer, cache: (any KVCache)?) -> MLXArray {
+        if mode == .hybrid { return runHybrid(x, layer: layer, cache: cache) }
         let dtype = x.dtype
         let paramType = layer.inputNorm.dtype
         let hidden = x.dim(2)
@@ -124,7 +195,10 @@ enum Qwen3TTSFusedStep {
     // instead baked into the source as `using`/`constexpr` definitions
     // under its own kernel name, and the kernel object cached.
 
-    enum Kind: String { case qkv = "qwen_qkv", matvec = "qwen_mv_res", gateUp = "qwen_gateup" }
+    enum Kind: String {
+        case qkv = "qwen_qkv", matvec = "qwen_mv_res", gateUp = "qwen_gateup"
+        case qkvPost = "qwen_qkv_post", addNorm = "qwen_add_norm", siluMul = "qwen_silu_mul"
+    }
 
     private struct Key: Hashable {
         let kind: Kind, dtype: DType, paramType: DType, k: Int, nt: Int, nq: Int, nkv: Int, xType: DType
@@ -178,6 +252,17 @@ enum Qwen3TTSFusedStep {
             built = MLXFast.metalKernel(
                 name: name, inputNames: ["x", "postW", "wg", "sg", "bg", "wu", "su", "bu", "params"],
                 outputNames: ["out"], source: gateUpSource, header: defs + header)
+        case .qkvPost:
+            built = MLXFast.metalKernel(
+                name: name, inputNames: ["qkv", "qnW", "knW", "params", "pos"],
+                outputNames: ["q", "k", "v"], source: qkvPostSource, header: defs)
+        case .addNorm:
+            built = MLXFast.metalKernel(
+                name: name, inputNames: ["a", "b", "w", "params"],
+                outputNames: ["sum", "normed"], source: addNormSource, header: defs)
+        case .siluMul:
+            built = MLXFast.metalKernel(
+                name: name, inputNames: ["gu"], outputNames: ["out"], source: siluMulSource, header: defs)
         }
         kernels[key] = built
         return built
@@ -273,6 +358,76 @@ enum Qwen3TTSFusedStep {
         for (int r = 0; r < R; ++r) out[r] = simd_sum(acc[r]);
     }
     """
+
+    /// Glue after the fused q/k/v matmul: per-head rmsnorm on q and k, RoPE
+    /// at `pos`, and the split into (1, heads, 1, 128) tensors. One 128-thread
+    /// group per head, one element per thread.
+    static let qkvPostSource = """
+        threadgroup float red[4];
+        const uint tid = thread_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd = simdgroup_index_in_threadgroup;
+        const uint head = threadgroup_position_in_grid.x;       // 0..<NQ+2·NKV
+        const float eps = params[0];
+        const float theta = params[1];
+        const float v0 = float(qkv[head * 128 + tid]);
+        if (head >= NQ + NKV) { v[(head - NQ - NKV) * 128 + tid] = T(v0); return; }
+        const bool isQ = head < NQ;
+        device T* out = isQ ? q + head * 128 : k + (head - NQ) * 128;
+        const device S* nw = isQ ? qnW : knW;
+        const float part = simd_sum(v0 * v0);
+        if (lane == 0) red[simd] = part;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv = metal::rsqrt((red[0] + red[1] + red[2] + red[3]) / 128.0f + eps);
+        const float n0 = v0 * inv * float(nw[tid]);
+        // rotate-half pairs (i, i+64): fetch the partner through threadgroup memory
+        threadgroup float hs[128];
+        hs[tid] = n0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint i = tid & 63;
+        const float freq = metal::pow(theta, -float(i) / 64.0f);
+        const float angle = float(pos[0]) * freq;
+        const float c = metal::cos(angle), s = metal::sin(angle);
+        const float a = hs[i], b = hs[i + 64];
+        out[tid] = tid < 64 ? T(a * c - b * s) : T(b * c + a * s);
+        """
+
+    /// sum = a + b; normed = rmsnorm(sum)·w. One 256-thread group, K/256
+    /// elements per thread (`a` in T, `b` in TX).
+    static let addNormSource = """
+        threadgroup float red[8];
+        const uint tid = thread_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd = simdgroup_index_in_threadgroup;
+        float vals[K / 256];
+        float ss = 0;
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < K / 256; ++j) {
+            const int i = tid + 256 * j;
+            const float v = float(a[i]) + float(b[i]);
+            vals[j] = v; ss += v * v;
+            sum[i] = T(v);
+        }
+        const float part = simd_sum(ss);
+        if (lane == 0) red[simd] = part;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0;
+        _Pragma("clang loop unroll(full)")
+        for (int r = 0; r < 8; ++r) total += red[r];
+        const float inv = metal::rsqrt(total / float(K) + params[0]);
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < K / 256; ++j) {
+            const int i = tid + 256 * j;
+            normed[i] = T(vals[j] * inv * float(w[i]));
+        }
+        """
+
+    /// out[i] = silu(gu[i]) · gu[i + K] over the concatenated gate/up output.
+    static let siluMulSource = """
+        const uint i = thread_position_in_grid.x;
+        const float g = float(gu[i]);
+        out[i] = T(g / (1.0f + metal::exp(-g)) * float(gu[i + K]));
+        """
 
     /// rmsnorm → q/k/v projections → q/k head norm → RoPE. One NT-thread
     /// group per head (NQ q heads, then NKV k heads, then NKV v heads); the

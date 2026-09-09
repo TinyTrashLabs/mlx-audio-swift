@@ -90,6 +90,29 @@ public enum Qwen3TTSFusedBench {
         }
         }
         Qwen3TTSFusedStep.matvecThreads = 128
+
+        // Whole decoder-layer steps (no cache): the number that matters.
+        do {
+            let config = try JSONDecoder().decode(Qwen3TTSTalkerConfig.self, from: "{}".data(using: .utf8)!)
+            let layer = TalkerDecoderLayer(config: config, layerIdx: 0)
+            layer.update(parameters: ModuleParameters.unflattened(layer.parameters().flattened().map { ($0.0, $0.1.asType(dtype)) }))
+            quantize(model: layer, groupSize: 64, bits: 4)
+            eval(layer.parameters())
+            let wasRope = Qwen3TTSModel.fastRope, wasFused = Qwen3TTSModel.fusedLayers, wasMode = Qwen3TTSFusedStep.mode
+            Qwen3TTSModel.fastRope = true
+            for _ in 0 ..< 2 {
+                Qwen3TTSModel.fusedLayers = false
+                timed("layer step: module path") { (0 ..< ops).map { _ in layer(x, positionEmbeddings: (x, x), mask: nil, cache: nil) } }
+                Qwen3TTSModel.fusedLayers = true
+                Qwen3TTSFusedStep.mode = .hybrid
+                timed("layer step: hybrid") { (0 ..< ops).map { _ in layer(x, positionEmbeddings: (x, x), mask: nil, cache: nil) } }
+                Qwen3TTSFusedStep.mode = .customMatvec
+                timed("layer step: custom matvec") { (0 ..< ops).map { _ in layer(x, positionEmbeddings: (x, x), mask: nil, cache: nil) } }
+            }
+            Qwen3TTSModel.fastRope = wasRope; Qwen3TTSModel.fusedLayers = wasFused; Qwen3TTSFusedStep.mode = wasMode
+        } catch {
+            progress("layer step bench failed: \(error)")
+        }
         return results
     }
 }

@@ -17,6 +17,7 @@ final class QwenFusedLayerParityTests: XCTestCase {
         MLX.Device.setDefault(device: Device(.gpu))
         MLXRandom.seed(11)
         Qwen3TTSModel.fastRope = true
+        Qwen3TTSFusedStep.mode = .hybrid
     }
 
     override func tearDown() {
@@ -112,6 +113,13 @@ final class QwenFusedLayerParityTests: XCTestCase {
 
     func testFusedStepMatchesModulePathInFloat32() throws {
         try assertParity(dtype: .float32, tolerance: 2e-3)
+    }
+
+    func testCustomMatvecModeMatchesModulePath() throws {
+        Qwen3TTSFusedStep.mode = .customMatvec
+        defer { Qwen3TTSFusedStep.mode = .hybrid }
+        try assertParity(dtype: .float32, tolerance: 2e-3)
+        try assertParity(dtype: .bfloat16, tolerance: 0.25)
     }
 
     func testFusedStepMatchesModulePathInBFloat16() throws {
