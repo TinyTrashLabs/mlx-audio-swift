@@ -38,8 +38,12 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// constants (see `Qwen3TTSCodePredictor.compiledLogits`). 0 until measured.
     public nonisolated(unsafe) static var codePredictorMode = 0
     /// Rotate q/k with MLXFast.RoPE (one kernel each) instead of the
-    /// slice/negate/concat/multiply/add chain. Equivalent for this model.
-    public nonisolated(unsafe) static var fastRope = false
+    /// slice/negate/concat/multiply/add chain. On by default since 2026-09-09:
+    /// besides ~1,400 fewer launches a frame, the kernel is the more accurate
+    /// path — against an exact host RoPE it is within 2e-4 at position 1000,
+    /// while the module chain (MLX pow/cos/sin) drifts to 0.02 at position 9
+    /// and 0.20 at position 200 on |q| ≈ 3 (QwenRopeParityTests).
+    public nonisolated(unsafe) static var fastRope = true
     /// Skip the every-50-steps Metal cache flush inside the loop (the caller
     /// bounds the cache with `Memory.cacheLimit` anyway).
     public nonisolated(unsafe) static var skipLoopCacheClear = false
