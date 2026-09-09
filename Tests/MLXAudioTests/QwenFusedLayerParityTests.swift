@@ -152,6 +152,29 @@ final class QwenFusedLayerParityTests: XCTestCase {
         XCTAssertLessThan(maxAbsDiff(ref, out), 0.25)
     }
 
+    func testModulePathStillAgreesAfterConcatAdoptsItsWeights() throws {
+        // concat(for:) swaps the layer's q/k/v/gate/up tensors for views into
+        // the concatenated arrays. The module path (prefill) must be unchanged
+        // by that, and the adoption must not grow live memory by the size of
+        // the concatenations (the originals are released).
+        let talker = try talkerLayer(dtype: .bfloat16)
+        let prefix = MLXRandom.normal([1, 5, 1024]).asType(.bfloat16)
+        Qwen3TTSModel.fusedLayers = false
+        let before = talker(prefix, positionEmbeddings: (prefix, prefix), mask: nil, cache: KVCacheSimple())
+        eval(before)
+        Memory.clearCache()
+        let liveBefore = Memory.activeMemory
+        _ = Qwen3TTSFusedStep.concat(for: try XCTUnwrap(talker.fusedLayer()))
+        Memory.clearCache()
+        let liveAfter = Memory.activeMemory
+        let after = talker(prefix, positionEmbeddings: (prefix, prefix), mask: nil, cache: KVCacheSimple())
+        eval(after)
+        XCTAssertLessThan(maxAbsDiff(before, after), 1e-6)
+        // 5 MB of concatenations per layer; the originals must be gone.
+        XCTAssertLessThan(liveAfter - liveBefore, 1_000_000, "live memory grew by \(liveAfter - liveBefore) bytes")
+        XCTAssertEqual(ObjectIdentifier(talker.selfAttn.qProj.weight), ObjectIdentifier(try XCTUnwrap(talker.fusedLayer()).q.weight))
+    }
+
     func testFusedStepIsSkippedForPrefill() throws {
         // A multi-token input never takes the fused path (it is a single-
         // token kernel); the flag must not change prefill results.

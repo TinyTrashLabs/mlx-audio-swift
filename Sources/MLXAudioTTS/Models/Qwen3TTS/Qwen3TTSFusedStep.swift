@@ -91,6 +91,26 @@ enum Qwen3TTSFusedStep {
             guS: concatenated([layer.gate.scales, layer.up.scales], axis: 0),
             guB: concatenated([layer.gate.biases, layer.up.biases], axis: 0))
         eval(c.qkvW, c.qkvS, c.qkvB, c.guW, c.guS, c.guB)
+        // Hand the layer's own tensors row-slices of the concatenations (views
+        // over the same buffers) so the originals are freed: otherwise the
+        // fused path carries +5 MB per layer (+165 MB on the 0.6B), which on
+        // the iPhone 15 Pro was the difference between surviving the ~1.3 GB
+        // transient of a 2 s decode chunk on long text and being jetsammed
+        // (2026-09-09). The module path (prefill) keeps working on the views,
+        // and the cache key (the q weight's identity) is unchanged.
+        let (nq, nk) = (layer.q.scales.dim(0), layer.k.scales.dim(0))
+        let nv = layer.v.scales.dim(0)
+        let ni = layer.gate.scales.dim(0)
+        func adopt(_ p: Layer.Projection, _ w: MLXArray, _ sc: MLXArray, _ b: MLXArray, _ range: Range<Int>) {
+            let (ws, ss, bs) = (w[range], sc[range], b[range])
+            eval(ws, ss, bs)
+            p.weight._updateInternal(ws); p.scales._updateInternal(ss); p.biases._updateInternal(bs)
+        }
+        adopt(layer.q, c.qkvW, c.qkvS, c.qkvB, 0 ..< nq)
+        adopt(layer.k, c.qkvW, c.qkvS, c.qkvB, nq ..< nq + nk)
+        adopt(layer.v, c.qkvW, c.qkvS, c.qkvB, nq + nk ..< nq + nk + nv)
+        adopt(layer.gate, c.guW, c.guS, c.guB, 0 ..< ni)
+        adopt(layer.up, c.guW, c.guS, c.guB, ni ..< 2 * ni)
         concats[key] = c
         return c
     }
