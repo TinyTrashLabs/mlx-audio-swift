@@ -66,9 +66,9 @@ enum Qwen3TTSFusedStep {
     /// Threads per group. qkv needs a whole head (128 rows) per group for
     /// the head norm, so it runs 32 simdgroups of 4 rows; the others run
     /// four simdgroups (16 rows) per group so enough groups are in flight.
-    static let qkvThreads = 512
-    static let matvecThreads = 128
-    static let gateUpThreads = 128
+    nonisolated(unsafe) static var qkvThreads = 512
+    nonisolated(unsafe) static var matvecThreads = 128
+    nonisolated(unsafe) static var gateUpThreads = 128
     static var matvecRowsPerGroup: Int { matvecThreads / 8 }
     static var gateUpRowsPerGroup: Int { gateUpThreads / 8 }
 
@@ -105,7 +105,7 @@ enum Qwen3TTSFusedStep {
         return matvecResidual(activated, layer.down, residual: afterAttention, inputWidth: intermediate, rows: hidden)
     }
 
-    private static func matvecResidual(_ x: MLXArray, _ p: Layer.Projection, residual: MLXArray,
+    static func matvecResidual(_ x: MLXArray, _ p: Layer.Projection, residual: MLXArray,
                                        inputWidth: Int, rows: Int) -> MLXArray {
         // `x` may not share the residual's dtype (on the phone MLX's SDPA
         // hands back float32 for bf16 inputs), so the kernel carries both.
@@ -185,39 +185,52 @@ enum Qwen3TTSFusedStep {
 
     // MARK: - Metal
 
-    /// Shared device code: the quantized row dot product and reductions.
+    /// Shared device code.
     ///
-    /// x lives in threadgroup memory transposed within each 1024-wide chunk
-    /// (element c·1024 + 32·l + i is stored at c·1024 + 32·i + l), so the 32
-    /// lanes of a simdgroup read consecutive words at every step instead of
-    /// a 32-way bank conflict. Rows go in batches of R with all their weight
-    /// loads issued before the arithmetic, which is what keeps enough bytes in
-    /// flight for the matvec to run at memory speed.
+    /// No threadgroup staging of x: every simdgroup covers the whole K-vector
+    /// on its own (lane l owns elements [c·1024 + 32·l, +32) of chunk c), so
+    /// each lane reads its slice straight from device memory into registers,
+    /// the rmsnorm's sum of squares is a plain simd_sum, and the matvec needs
+    /// no barrier and no threadgroup memory. (The first cut staged x in a
+    /// K-float threadgroup array; at K = 3072 that is 12 KB per group, which
+    /// caps an Apple GPU core at two or three groups and starves the memory
+    /// system.) Rows go in batches of R with all weight loads issued first.
     static let header = """
-    // Sum over the whole NT-thread group; `red` is NT/32 threadgroup floats.
-    inline float qwen_tg_sum(float v, threadgroup float* red, uint lane, uint simd) {
-        v = simd_sum(v);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) red[simd] = v;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float total = 0;
+    // The lane's slices of every chunk of x, as float, times `scale` and (if
+    // `w` is non-null) the per-element weight: xv[c * 32 + i] holds element
+    // c·1024 + 32·lane + i. Loaded once per lane and reused for every row.
+    template <typename X>
+    inline void qwen_load_x(const device X* x, const device S* w, uint lane, float scale, thread float* xv) {
         _Pragma("clang loop unroll(full)")
-        for (int i = 0; i < NT / 32; ++i) total += red[i];
-        return total;
+        for (int c = 0; c < K / 1024; ++c) {
+            const int e0 = c * 1024 + 32 * int(lane);
+            _Pragma("clang loop unroll(full)")
+            for (int i = 0; i < 32; ++i) {
+                float v = float(x[e0 + i]) * scale;
+                if (w != nullptr) v *= float(w[e0 + i]);
+                xv[c * 32 + i] = v;
+            }
+        }
     }
 
-    // Element index held at transposed slot `t` (see the Swift comment).
-    inline int qwen_elem(int t) {
-        const int c = t >> 10, r = t & 1023;
-        return (c << 10) + ((r & 31) << 5) + (r >> 5);
+    // 1/rms over the whole K-vector (identical on every lane of the simdgroup).
+    template <typename X>
+    inline float qwen_inv_rms(const device X* x, uint lane, float eps) {
+        float ss = 0;
+        for (int c = 0; c < K / 1024; ++c) {
+            const int e0 = c * 1024 + 32 * int(lane);
+            _Pragma("clang loop unroll(full)")
+            for (int i = 0; i < 32; ++i) { const float v = float(x[e0 + i]); ss += v * v; }
+        }
+        return metal::rsqrt(simd_sum(ss) / float(K) + eps);
     }
 
     // R rows (row0, row0+1, …) of a [rows, K/8] uint32 4-bit affine matrix
-    // (group 64, scale·q + bias) dotted with the transposed xs; the reduced
+    // (group 64, scale·q + bias) dotted with the preloaded xv; the reduced
     // values land in out[0..R) on every lane.
     template <int R>
-    inline void qwen_rows_dot(const device uint* w, const device S* scales, const device S* biases,
-                              uint row0, threadgroup const float* xs, uint lane, thread float* out) {
+    inline void qwen_rows_dot(const device uint* wq, const device S* scales, const device S* biases,
+                              uint row0, thread const float* xv, uint lane, thread float* out) {
         constexpr int wordsPerRow = K / 8;
         constexpr int groupsPerRow = K / 64;
         float acc[R];
@@ -232,7 +245,7 @@ enum Qwen3TTSFusedStep {
             _Pragma("clang loop unroll(full)")
             for (int r = 0; r < R; ++r) {
                 const uint row = row0 + r;
-                packed[r] = *((const device uint4*)(w + row * wordsPerRow + e0 / 8));
+                packed[r] = *((const device uint4*)(wq + row * wordsPerRow + e0 / 8));
                 s[r] = float(scales[row * groupsPerRow + g]);
                 b[r] = float(biases[row * groupsPerRow + g]);
             }
@@ -240,17 +253,16 @@ enum Qwen3TTSFusedStep {
             float sq[R];
             _Pragma("clang loop unroll(full)")
             for (int r = 0; r < R; ++r) sq[r] = 0;
-            threadgroup const float* xp = xs + c * 1024 + lane;
             _Pragma("clang loop unroll(full)")
             for (int j = 0; j < 4; ++j) {
                 _Pragma("clang loop unroll(full)")
                 for (int n = 0; n < 8; ++n) {
-                    const float xv = xp[32 * (8 * j + n)];
-                    sx += xv;
+                    const float v = xv[c * 32 + 8 * j + n];
+                    sx += v;
                     _Pragma("clang loop unroll(full)")
                     for (int r = 0; r < R; ++r) {
                         const uint wv = j == 0 ? packed[r].x : j == 1 ? packed[r].y : j == 2 ? packed[r].z : packed[r].w;
-                        sq[r] += xv * float((wv >> (4 * n)) & 0xfu);
+                        sq[r] += v * float((wv >> (4 * n)) & 0xfu);
                     }
                 }
             }
@@ -260,32 +272,12 @@ enum Qwen3TTSFusedStep {
         _Pragma("clang loop unroll(full)")
         for (int r = 0; r < R; ++r) out[r] = simd_sum(acc[r]);
     }
-
-    // xs = transposed(rmsnorm(x) · weight) in float, over the whole group.
-    // Returns with xs complete (barrier included).
-    inline void qwen_load_normed(const device T* x, const device S* weight, float eps,
-                                 threadgroup float* xs, threadgroup float* red,
-                                 uint tid, uint lane, uint simd) {
-        float ss = 0;
-        for (int t = tid; t < K; t += NT) { const float v = float(x[qwen_elem(t)]); xs[t] = v; ss += v * v; }
-        const float inv = metal::rsqrt(qwen_tg_sum(ss, red, lane, simd) / float(K) + eps);
-        for (int t = tid; t < K; t += NT) xs[t] = xs[t] * inv * float(weight[qwen_elem(t)]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // xs = transposed(x) in float; barrier included.
-    template <typename X>
-    inline void qwen_load(const device X* x, threadgroup float* xs, uint tid) {
-        for (int t = tid; t < K; t += NT) xs[t] = float(x[qwen_elem(t)]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
     """
 
     /// rmsnorm → q/k/v projections → q/k head norm → RoPE. One NT-thread
     /// group per head (NQ q heads, then NKV k heads, then NKV v heads); the
     /// NT/32 simdgroups share the head's 128 rows four at a time.
     static let qkvSource = """
-        threadgroup float xs[K];
         threadgroup float hs[128];
         threadgroup float red[NT / 32];
         const uint tid = thread_index_in_threadgroup;
@@ -294,8 +286,8 @@ enum Qwen3TTSFusedStep {
         const uint block = threadgroup_position_in_grid.x;
         const float eps = params[0];
         const float theta = params[1];
-
-        qwen_load_normed(x, inW, eps, xs, red, tid, lane, simd);
+        float xv[K / 32];
+        qwen_load_x<T>(x, inW, lane, qwen_inv_rms<T>(x, lane, eps), xv);
 
         const device uint* w; const device S* sc; const device S* bi; device T* out; const device S* nw;
         uint head; bool rotate = true;
@@ -304,10 +296,9 @@ enum Qwen3TTSFusedStep {
         else { head = block - NQ - NKV; w = wv; sc = sv; bi = bv; out = v; rotate = false; nw = qnW; }
 
         // 128 rows per head over NT/32 simdgroups, four rows each pass.
-        _Pragma("clang loop unroll(full)")
         for (uint local = simd * 4; local < 128; local += (NT / 32) * 4) {
             float dots[4];
-            qwen_rows_dot<4>(w, sc, bi, head * 128 + local, xs, lane, dots);
+            qwen_rows_dot<4>(w, sc, bi, head * 128 + local, xv, lane, dots);
             if (lane == 0) { hs[local] = dots[0]; hs[local + 1] = dots[1]; hs[local + 2] = dots[2]; hs[local + 3] = dots[3]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -318,9 +309,14 @@ enum Qwen3TTSFusedStep {
         }
         // Per-head rmsnorm (q_norm / k_norm), then rotate-half RoPE at `pos`.
         const float hv = tid < 128 ? hs[tid] : 0.0f;
-        const float inv = metal::rsqrt(qwen_tg_sum(hv * hv, red, lane, simd) / 128.0f + eps);
+        float ss = simd_sum(hv * hv);
+        if (lane == 0) red[simd] = ss;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < 128) hs[tid] = hv * inv * float(nw[tid]);
+        ss = 0;
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < NT / 32; ++i) ss += red[i];
+        const float hinv = metal::rsqrt(ss / 128.0f + eps);
+        if (tid < 128) hs[tid] = hv * hinv * float(nw[tid]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid < 64) {
             const float freq = metal::pow(theta, -float(tid) / 64.0f);
@@ -335,15 +331,14 @@ enum Qwen3TTSFusedStep {
     /// out = residual + W·x for a [rows, K] matrix; NT/8 rows per group,
     /// four per simdgroup.
     static let matvecSource = """
-        threadgroup float xs[K];
-        const uint tid = thread_index_in_threadgroup;
         const uint lane = thread_index_in_simdgroup;
         const uint simd = simdgroup_index_in_threadgroup;
         const uint block = threadgroup_position_in_grid.x;
-        qwen_load(x, xs, tid);
         const uint row0 = block * (NT / 8) + simd * 4;
+        float xv[K / 32];
+        qwen_load_x<TX>(x, nullptr, lane, 1.0f, xv);
         float dots[4];
-        qwen_rows_dot<4>(w, sc, bi, row0, xs, lane, dots);
+        qwen_rows_dot<4>(w, sc, bi, row0, xv, lane, dots);
         if (lane == 0) {
             out[row0] = T(float(resid[row0]) + dots[0]);
             out[row0 + 1] = T(float(resid[row0 + 1]) + dots[1]);
@@ -355,17 +350,15 @@ enum Qwen3TTSFusedStep {
     /// rmsnorm → silu(gate·x) · (up·x); NT/8 output rows per group, four
     /// per simdgroup (a gate row and its up row each).
     static let gateUpSource = """
-        threadgroup float xs[K];
-        threadgroup float red[NT / 32];
-        const uint tid = thread_index_in_threadgroup;
         const uint lane = thread_index_in_simdgroup;
         const uint simd = simdgroup_index_in_threadgroup;
         const uint block = threadgroup_position_in_grid.x;
-        qwen_load_normed(x, postW, params[0], xs, red, tid, lane, simd);
+        float xv[K / 32];
+        qwen_load_x<T>(x, postW, lane, qwen_inv_rms<T>(x, lane, params[0]), xv);
         const uint row0 = block * (NT / 8) + simd * 4;
         float g[4], u[4];
-        qwen_rows_dot<4>(wg, sg, bg, row0, xs, lane, g);
-        qwen_rows_dot<4>(wu, su, bu, row0, xs, lane, u);
+        qwen_rows_dot<4>(wg, sg, bg, row0, xv, lane, g);
+        qwen_rows_dot<4>(wu, su, bu, row0, xv, lane, u);
         if (lane == 0) {
             _Pragma("clang loop unroll(full)")
             for (int r = 0; r < 4; ++r) out[row0 + r] = T(g[r] / (1.0f + metal::exp(-g[r])) * u[r]);
