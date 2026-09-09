@@ -128,6 +128,9 @@ final class CodePredictorDecoderLayer: Module {
         mask: MLXArray? = nil,
         cache: (any KVCache)? = nil
     ) -> MLXArray {
+        if Qwen3TTSModel.fusedLayers, x.dim(0) == 1, x.dim(1) == 1, let fused = fusedLayer() {
+            return Qwen3TTSFusedStep.run(x, layer: fused, cache: cache)
+        }
         var out = x + selfAttn(inputLayernorm(x), positionEmbeddings: positionEmbeddings, mask: mask, cache: cache)
         out = out + mlp(postAttentionLayernorm(out))
         return out

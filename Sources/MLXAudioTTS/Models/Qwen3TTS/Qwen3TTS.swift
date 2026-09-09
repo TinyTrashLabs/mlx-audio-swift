@@ -45,6 +45,15 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     public nonisolated(unsafe) static var skipLoopCacheClear = false
     /// Greedy (argmax) sub-codebooks 1…15; only the first codebook samples.
     public nonisolated(unsafe) static var greedySubCodes = false
+    /// Streaming decode off the generation thread: 0 = inline (upstream),
+    /// 1 = a serial background queue on the same GPU stream (the loop no
+    /// longer waits for the decoder's GPU work), 2 = same, on a fresh GPU
+    /// stream per chunk so the decoder can overlap the loop's dispatch gaps.
+    public nonisolated(unsafe) static var asyncDecode = 0
+    /// Single-token decoder layers run as four fused Metal kernels (see
+    /// `Qwen3TTSFusedStep`) instead of ~22 MLX launches. Prefill and any
+    /// layer whose weights are not 4-bit/group-64 keep the module path.
+    public nonisolated(unsafe) static var fusedLayers = false
     public nonisolated(unsafe) static var loopProfile: [String: Double] = [:]
     public nonisolated(unsafe) static var loopProfileFrames = 0
     private static func profileAdd(_ key: String, _ seconds: Double) {
@@ -485,6 +494,25 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let eosTokenArray = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
         let codeCache = talker.codePredictor.makeCache()
 
+        // Async streaming decode (see `asyncDecode`): chunks decode on this
+        // serial queue in order; the loop only evals the codes it hands over.
+        let decodeQueue = DispatchQueue(label: "qwen3tts.streaming-decode", qos: .userInitiated)
+        func decodeChunkAsync(_ codesForDecoder: MLXArray, _ onAudioChunk: @escaping (MLXArray) -> Void) {
+            decodeQueue.async {
+                let work = {
+                    let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
+                    let audioChunk = decoded[0]
+                    eval(audioChunk)
+                    onAudioChunk(audioChunk)
+                }
+                if Self.asyncDecode == 2 {
+                    Stream.withNewDefaultStream(device: Device(.gpu), work)
+                } else {
+                    work()
+                }
+            }
+        }
+
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
         }
@@ -612,13 +640,16 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     let codesChunk = stacked(Array(generatedCodes[decodedTokens...]), axis: 1)
                     let codesForDecoder = codesChunk.transposed(0, 2, 1)
                     eval(codesForDecoder)
-                    let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
-                    let audioChunk = decoded[0]
-                    eval(audioChunk)
-                    if profiling { Self.profileAdd("decode", Date().timeIntervalSince(stageStart)); stageStart = Date() }
-
                     decodedTokens = generatedCodes.count
-                    onAudioChunk(audioChunk)
+                    if Self.asyncDecode > 0 {
+                        decodeChunkAsync(codesForDecoder, onAudioChunk)
+                    } else {
+                        let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
+                        let audioChunk = decoded[0]
+                        eval(audioChunk)
+                        onAudioChunk(audioChunk)
+                    }
+                    if profiling { Self.profileAdd("decode", Date().timeIntervalSince(stageStart)); stageStart = Date() }
                 }
             }
 
@@ -649,6 +680,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         // Streaming path: yield remaining tokens and return early
         if let onAudioChunk {
+            // Every queued chunk lands, in order, before the tail decodes.
+            if Self.asyncDecode > 0 { decodeQueue.sync {} }
             if generatedCodes.count > decodedTokens {
                 let codesChunk = stacked(Array(generatedCodes[decodedTokens...]), axis: 1)
                 let codesForDecoder = codesChunk.transposed(0, 2, 1)
