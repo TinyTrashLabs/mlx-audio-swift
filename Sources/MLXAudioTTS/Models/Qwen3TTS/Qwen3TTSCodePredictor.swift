@@ -110,6 +110,11 @@ final class CodePredictorMLP: Module {
 // MARK: - Code Predictor Decoder Layer
 
 final class CodePredictorDecoderLayer: Module {
+    /// `fusedLayer()`'s once-per-layer result (nil when the weights are not
+    /// fusable); resolved on first use, after the weights are loaded. Plain
+    /// stored properties, so Module's reflection ignores them.
+    var fusedLayerCache: Qwen3TTSFusedStep.Layer?
+    var fusedLayerResolved = false
     @ModuleInfo(key: "self_attn") var selfAttn: CodePredictorAttention
     @ModuleInfo var mlp: CodePredictorMLP
     @ModuleInfo(key: "input_layernorm") var inputLayernorm: RMSNorm

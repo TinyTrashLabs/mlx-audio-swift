@@ -54,9 +54,18 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// longer waits for the decoder's GPU work), 2 = same, on a fresh GPU
     /// stream per chunk so the decoder can overlap the loop's dispatch gaps.
     public nonisolated(unsafe) static var asyncDecode = 0
-    /// Single-token decoder layers run as four fused Metal kernels (see
-    /// `Qwen3TTSFusedStep`) instead of ~22 MLX launches. Prefill and any
-    /// layer whose weights are not 4-bit/group-64 keep the module path.
+    /// Pipeline the frame (Mac profile, 2026-09-18): dispatch the talker's
+    /// graph as soon as it is built, and each code-predictor sub-step's as
+    /// soon as its token is sampled, so the GPU runs stage k while Swift
+    /// builds stage k+1. Upstream builds the whole frame (~2,400 lazy ops)
+    /// and evals once, which leaves the GPU idle during the build and the
+    /// CPU idle during the drain. Bit-exact with the same seed: the graph
+    /// is unchanged, only when it is committed.
+    public nonisolated(unsafe) static var pipelineFrame = false
+    /// Single-token decoder layers run as the fused step (see
+    /// `Qwen3TTSFusedStep`: MLX quantized matmuls plus custom glue kernels)
+    /// instead of ~22 MLX launches. Prefill, and any layer whose weights are
+    /// not 4- or 8-bit affine without biases, keep the module path.
     public nonisolated(unsafe) static var fusedLayers = false
     public nonisolated(unsafe) static var loopProfile: [String: Double] = [:]
     public nonisolated(unsafe) static var loopProfileFrames = 0
@@ -520,25 +529,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let codecTokenRateHz = 12.5
         let streamingChunkSize = max(1, Int(streamingInterval * codecTokenRateHz))
         var decodedTokens = 0
-        // Trailing-silence stop (see `trailingSilenceStopSeconds`): seconds of
-        // near-silence at the end of the audio streamed so far, and whether
-        // anything above the floor has been heard yet.
-        var trailingSilence = 0.0
-        var heardSpeech = false
-        func noteChunk(_ audioChunk: MLXArray) {
-            let windowLen = max(1, self.sampleRate / 50) // 20 ms
-            let windows = audioChunk.dim(0) / windowLen
-            guard windows > 0 else { return }
-            let frames = audioChunk[0 ..< (windows * windowLen)].reshaped(windows, windowLen).asType(.float32)
-            let rmsDb = 20 * log10(sqrt(mean(square(frames), axis: -1)) + 1e-9)
-            let loud = (rmsDb .> Self.trailingSilenceFloorDb).asArray(Bool.self)
-            if let lastLoud = loud.lastIndex(of: true) {
-                heardSpeech = true
-                trailingSilence = Double(windows - 1 - lastLoud) * Double(windowLen) / Double(self.sampleRate)
-            } else {
-                trailingSilence += Double(windows * windowLen) / Double(self.sampleRate)
-            }
-        }
+        // Trailing-silence stop (see `trailingSilenceStopSeconds`). Shared
+        // with the async decode queue, which notes chunks off the loop's
+        // thread (before 2026-09-18 that path skipped the check entirely,
+        // so enabling `asyncDecode` silently disabled the backstop).
+        let silence = TrailingSilenceTracker(sampleRate: sampleRate)
 
         var trailingIdx = 0
         var inputEmbeds = inputEmbedsInit
@@ -555,6 +550,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     let audioChunk = decoded[0]
                     eval(audioChunk)
                     onAudioChunk(audioChunk)
+                    if Self.trailingSilenceStopSeconds > 0 { silence.note(audioChunk) }
                 }
                 if Self.asyncDecode == 2 {
                     Stream.withNewDefaultStream(device: Device(.gpu), work)
@@ -584,6 +580,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             var stageStart = Date()
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
+            if Self.pipelineFrame { asyncEval(logits, hidden) }
             if profiling { eval(logits, hidden); Self.profileAdd("talker", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Sample first codebook token
@@ -637,6 +634,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                         minP: minP
                     )
                     codeTokens.append(nextCode)
+                    if Self.pipelineFrame { asyncEval(nextCode) }
                 }
             } else {
             for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
@@ -660,6 +658,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     minP: minP
                 )
                 codeTokens.append(nextCode)
+                if Self.pipelineFrame { asyncEval(nextCode) }
             }
             }
 
@@ -714,13 +713,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                         let audioChunk = decoded[0]
                         eval(audioChunk)
                         onAudioChunk(audioChunk)
-                        if Self.trailingSilenceStopSeconds > 0 {
-                            noteChunk(audioChunk)
-                            if heardSpeech, trailingSilence >= Self.trailingSilenceStopSeconds {
-                                Self.lastStopReason = .trailingSilence
-                                break
-                            }
-                        }
+                        if Self.trailingSilenceStopSeconds > 0 { silence.note(audioChunk) }
+                    }
+                    // On the async path this reflects the chunks decoded so
+                    // far, so the stop lands a chunk late at worst.
+                    if Self.trailingSilenceStopSeconds > 0,
+                       silence.trailingSeconds(afterSpeech: true) >= Self.trailingSilenceStopSeconds {
+                        Self.lastStopReason = .trailingSilence
+                        break
                     }
                     if profiling { Self.profileAdd("decode", Date().timeIntervalSince(stageStart)); stageStart = Date() }
                 }
@@ -1624,5 +1624,40 @@ enum Qwen3DecodePacing {
             return value
         }
         return nil
+    }
+}
+
+/// Seconds of near-silence at the end of the audio streamed so far, and
+/// whether anything above the floor has been heard yet. Locked, because the
+/// async decode queue notes chunks while the generation loop reads.
+final class TrailingSilenceTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private let sampleRate: Int
+    private var trailing = 0.0
+    private var heardSpeech = false
+
+    init(sampleRate: Int) { self.sampleRate = sampleRate }
+
+    func note(_ audioChunk: MLXArray) {
+        let windowLen = max(1, sampleRate / 50) // 20 ms
+        let windows = audioChunk.dim(0) / windowLen
+        guard windows > 0 else { return }
+        let frames = audioChunk[0 ..< (windows * windowLen)].reshaped(windows, windowLen).asType(.float32)
+        let rmsDb = 20 * log10(sqrt(mean(square(frames), axis: -1)) + 1e-9)
+        let loud = (rmsDb .> Qwen3TTSModel.trailingSilenceFloorDb).asArray(Bool.self)
+        lock.lock(); defer { lock.unlock() }
+        if let lastLoud = loud.lastIndex(of: true) {
+            heardSpeech = true
+            trailing = Double(windows - 1 - lastLoud) * Double(windowLen) / Double(sampleRate)
+        } else {
+            trailing += Double(windows * windowLen) / Double(sampleRate)
+        }
+    }
+
+    /// Trailing near-silence in seconds; 0 until speech has been heard when
+    /// `afterSpeech` is set (leading silence never counts as a tail).
+    func trailingSeconds(afterSpeech: Bool) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return afterSpeech && !heardSpeech ? 0 : trailing
     }
 }

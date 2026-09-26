@@ -33,7 +33,7 @@ final class QwenFusedLayerParityTests: XCTestCase {
     /// Random norm weights (the modules default to ones, which would hide a
     /// missing multiply) and 4-bit affine quantized projections, as loaded
     /// from the mobile checkpoint.
-    private func randomize(_ layer: Module, dtype: DType) {
+    private func randomize(_ layer: Module, dtype: DType, bits: Int = 4) {
         let params = layer.parameters().flattened().map { key, value -> (String, MLXArray) in
             if key.hasSuffix("norm.weight") {
                 return (key, (1 + 0.2 * MLXRandom.normal(value.shape)).asType(dtype))
@@ -41,22 +41,22 @@ final class QwenFusedLayerParityTests: XCTestCase {
             return (key, value.asType(dtype))
         }
         layer.update(parameters: ModuleParameters.unflattened(params))
-        quantize(model: layer, groupSize: 64, bits: 4)
+        quantize(model: layer, groupSize: 64, bits: bits)
         // quantize() leaves scales/biases in the weight's dtype already.
         eval(layer.parameters())
     }
 
-    private func talkerLayer(dtype: DType) throws -> TalkerDecoderLayer {
+    private func talkerLayer(dtype: DType, bits: Int = 4) throws -> TalkerDecoderLayer {
         let config = try JSONDecoder().decode(Qwen3TTSTalkerConfig.self, from: "{}".data(using: .utf8)!)
         let layer = TalkerDecoderLayer(config: config, layerIdx: 0)
-        randomize(layer, dtype: dtype)
+        randomize(layer, dtype: dtype, bits: bits)
         return layer
     }
 
-    private func codePredictorLayer(dtype: DType) throws -> CodePredictorDecoderLayer {
+    private func codePredictorLayer(dtype: DType, bits: Int = 4) throws -> CodePredictorDecoderLayer {
         let config = try JSONDecoder().decode(Qwen3TTSTalkerCodePredictorConfig.self, from: "{}".data(using: .utf8)!)
         let layer = CodePredictorDecoderLayer(config: config, layerIdx: 0)
-        randomize(layer, dtype: dtype)
+        randomize(layer, dtype: dtype, bits: bits)
         return layer
     }
 
@@ -72,13 +72,13 @@ final class QwenFusedLayerParityTests: XCTestCase {
         return out
     }
 
-    private func assertParity(dtype: DType, tolerance: Float, file: StaticString = #filePath, line: UInt = #line) throws {
+    private func assertParity(dtype: DType, bits: Int = 4, tolerance: Float, file: StaticString = #filePath, line: UInt = #line) throws {
         let hidden = 1024
         let prefix = MLXRandom.normal([1, 5, hidden]).asType(dtype)
         let token = MLXRandom.normal([1, 1, hidden]).asType(dtype)
         let unused = (token, token)
 
-        let talker = try talkerLayer(dtype: dtype)
+        let talker = try talkerLayer(dtype: dtype, bits: bits)
         // A layer the kernels cannot take falls back to the module path,
         // which would make the comparison below vacuous.
         XCTAssertNotNil(talker.fusedLayer(), "talker layer must be fusable", file: file, line: line)
@@ -88,13 +88,13 @@ final class QwenFusedLayerParityTests: XCTestCase {
         let tDiff = maxAbsDiff(tRef, tFused)
         XCTAssertLessThan(tDiff, tolerance, "talker layer \(dtype): max abs diff \(tDiff)", file: file, line: line)
 
-        let cp = try codePredictorLayer(dtype: dtype)
+        let cp = try codePredictorLayer(dtype: dtype, bits: bits)
         XCTAssertNotNil(cp.fusedLayer(), "code predictor layer must be fusable", file: file, line: line)
         let cRef = step({ x, c in cp(x, positionEmbeddings: unused, mask: nil, cache: c) }, prefix: prefix, token: token, fused: false)
         let cFused = step({ x, c in cp(x, positionEmbeddings: unused, mask: nil, cache: c) }, prefix: prefix, token: token, fused: true)
         let cDiff = maxAbsDiff(cRef, cFused)
         XCTAssertLessThan(cDiff, tolerance, "code predictor layer \(dtype): max abs diff \(cDiff)", file: file, line: line)
-        print("[fused-parity] \(dtype): talker \(tDiff), code predictor \(cDiff), output scale \(abs(tRef.asType(.float32)).max().item(Float.self))")
+        print("[fused-parity] \(dtype) \(bits)-bit: talker \(tDiff), code predictor \(cDiff), output scale \(abs(tRef.asType(.float32)).max().item(Float.self))")
     }
 
     func testFusedStepRunsTheKernelsDirectly() throws {
@@ -113,6 +113,47 @@ final class QwenFusedLayerParityTests: XCTestCase {
 
     func testFusedStepMatchesModulePathInFloat32() throws {
         try assertParity(dtype: .float32, tolerance: 2e-3)
+    }
+
+    /// The Mac's mlx-community checkpoints are 8-bit affine, group 64. The
+    /// hybrid step takes them since 2026-09-18 (its projections are MLX's
+    /// own quantized matmul, so nothing in it assumes a bit width).
+    func testHybridStepTakesEightBitLayers() throws {
+        let talker = try talkerLayer(dtype: .bfloat16, bits: 8)
+        let fused = try XCTUnwrap(talker.fusedLayer())
+        XCTAssertEqual(fused.bits, 8)
+        XCTAssertEqual(fused.groupSize, 64)
+        XCTAssertFalse(fused.customMatvecCapable)
+        try assertParity(dtype: .float32, bits: 8, tolerance: 2e-3)
+        try assertParity(dtype: .bfloat16, bits: 8, tolerance: 0.25)
+    }
+
+    /// The custom matvec kernels unpack 4-bit groups only; an 8-bit layer in
+    /// that mode must run the hybrid step rather than the kernels.
+    func testCustomMatvecModeFallsBackToHybridForEightBit() throws {
+        Qwen3TTSFusedStep.mode = .customMatvec
+        defer { Qwen3TTSFusedStep.mode = .hybrid }
+        try assertParity(dtype: .float32, bits: 8, tolerance: 2e-3)
+    }
+
+    /// Mixed widths within one layer cannot be concatenated for the shared
+    /// q/k/v and gate/up launches, so such a layer keeps the module path.
+    func testLayerWithMixedWidthsIsNotFusable() throws {
+        let talker = try talkerLayer(dtype: .float32, bits: 8)
+        XCTAssertNotNil(talker.fusedLayer())
+        let down = try XCTUnwrap(talker.mlp.downProj as? QuantizedLinear)
+        let fourBitDown = QuantizedLinear(
+            weight: dequantized(down.weight, scales: down.scales, biases: down.biases, groupSize: 64, bits: 8),
+            bias: nil, groupSize: 64, bits: 4)
+        let attn = talker.selfAttn
+        let mixed = Qwen3TTSFusedStep.Layer(
+            inputNorm: talker.inputLayernorm, postNorm: talker.postAttentionLayernorm,
+            qNorm: attn.qNorm, kNorm: attn.kNorm,
+            q: attn.qProj, k: attn.kProj, v: attn.vProj, o: attn.oProj,
+            gate: talker.mlp.gateProj, up: talker.mlp.upProj, down: fourBitDown,
+            numHeads: attn.numHeads, numKvHeads: attn.numKvHeads, headDim: attn.headDim,
+            eps: talker.inputLayernorm.eps, ropeTheta: attn.ropeTheta, scale: attn.scale)
+        XCTAssertNil(mixed)
     }
 
     func testCustomMatvecModeMatchesModulePath() throws {
@@ -153,7 +194,7 @@ final class QwenFusedLayerParityTests: XCTestCase {
     }
 
     func testModulePathStillAgreesAfterConcatAdoptsItsWeights() throws {
-        // concat(for:) swaps the layer's q/k/v/gate/up tensors for views into
+        // Building the fused layer swaps the layer's q/k/v/gate/up tensors for views into
         // the concatenated arrays. The module path (prefill) must be unchanged
         // by that, and the adoption must not grow live memory by the size of
         // the concatenations (the originals are released).
@@ -164,7 +205,7 @@ final class QwenFusedLayerParityTests: XCTestCase {
         eval(before)
         Memory.clearCache()
         let liveBefore = Memory.activeMemory
-        _ = Qwen3TTSFusedStep.concat(for: try XCTUnwrap(talker.fusedLayer()))
+        _ = try XCTUnwrap(talker.fusedLayer())
         Memory.clearCache()
         let liveAfter = Memory.activeMemory
         let after = talker(prefix, positionEmbeddings: (prefix, prefix), mask: nil, cache: KVCacheSimple())

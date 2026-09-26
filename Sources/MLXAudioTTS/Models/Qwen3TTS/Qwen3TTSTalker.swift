@@ -240,6 +240,11 @@ final class ResizeMLP: Module {
 // MARK: - Talker Decoder Layer
 
 final class TalkerDecoderLayer: Module {
+    /// `fusedLayer()`'s once-per-layer result (nil when the weights are not
+    /// fusable); resolved on first use, after the weights are loaded. Plain
+    /// stored properties, so Module's reflection ignores them.
+    var fusedLayerCache: Qwen3TTSFusedStep.Layer?
+    var fusedLayerResolved = false
     @ModuleInfo(key: "self_attn") var selfAttn: TalkerAttention
     @ModuleInfo var mlp: TalkerMLP
     @ModuleInfo(key: "input_layernorm") var inputLayernorm: RMSNorm

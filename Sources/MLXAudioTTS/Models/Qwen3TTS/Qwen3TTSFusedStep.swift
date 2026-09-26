@@ -23,15 +23,25 @@ import MLXNN
 // accumulates in float32 and is written back in the activation dtype.
 // Requires the mobile checkpoint's layout: 4-bit affine, group size 64,
 // no projection biases, head_dim 128, widths that are multiples of 1024.
+//
+// The `.hybrid` mode (the default, and the one that measured faster) never
+// reads a quantized weight in a custom kernel -- every projection goes
+// through MLX's `quantizedMM`, which takes any affine width -- so since
+// 2026-09-18 it also runs the 8-bit checkpoints (mlx-community's, group 64,
+// affine): a layer records its `bits`/`groupSize` and passes them through.
+// `.customMatvec` still unpacks 4-bit groups of 64 in-register and falls
+// back to the hybrid step for any other layout.
 enum Qwen3TTSFusedStep {
     /// One layer's tensors, in the order the kernels take them.
     struct Layer {
         struct Projection {
             let weight: MLXArray, scales: MLXArray, biases: MLXArray
+            let bits: Int, groupSize: Int
             init?(_ linear: Linear) {
-                guard let q = linear as? QuantizedLinear, q.bits == 4, q.groupSize == 64,
-                      q.mode == .affine, q.bias == nil, let biases = q.biases else { return nil }
+                guard let q = linear as? QuantizedLinear, q.mode == .affine, q.bias == nil,
+                      [4, 8].contains(q.bits), let biases = q.biases else { return nil }
                 weight = q.weight; scales = q.scales; self.biases = biases
+                bits = q.bits; groupSize = q.groupSize
             }
         }
         let inputNorm: MLXArray, postNorm: MLXArray, qNorm: MLXArray, kNorm: MLXArray
@@ -39,6 +49,19 @@ enum Qwen3TTSFusedStep {
         let gate: Projection, up: Projection, down: Projection
         let numHeads: Int, numKvHeads: Int, headDim: Int
         let eps: Float, ropeTheta: Float, scale: Float
+        /// Shared by every projection (the q/k/v and gate/up concatenations
+        /// need one layout, and `quantizedMM` takes one per call).
+        let bits: Int, groupSize: Int
+        /// The hand-written matvec kernels unpack 4-bit groups of 64 only.
+        var customMatvecCapable: Bool { bits == 4 && groupSize == 64 }
+        /// q/k/v and gate/up concatenated once, so each costs one launch in
+        /// the hybrid step; the projections above are views into these
+        /// (see `makeConcat`). Built here, so it lives exactly as long as
+        /// the layer that owns it: a process-wide cache keyed by weight
+        /// identity (2026-09-09 to 09-18) served a freed model's tensors to
+        /// whatever next landed at the same address, and pinned every
+        /// unloaded model's decoder weights for the life of the process.
+        let concat: Concat
 
         init?(inputNorm: RMSNorm, postNorm: RMSNorm, qNorm: RMSNorm, kNorm: RMSNorm,
               q: Linear, k: Linear, v: Linear, o: Linear, gate: Linear, up: Linear, down: Linear,
@@ -52,6 +75,10 @@ enum Qwen3TTSFusedStep {
                   q.scales.dim(0) == numHeads * headDim, k.scales.dim(0) == numKvHeads * headDim,
                   o.scales.dim(0) == hidden, down.scales.dim(0) == hidden,
                   inputNorm.weight.dtype == q.scales.dtype else { return nil }
+            let projections = [q, k, v, o, gate, up, down]
+            guard projections.allSatisfy({ $0.bits == q.bits && $0.groupSize == q.groupSize }) else { return nil }
+            self.bits = q.bits; self.groupSize = q.groupSize
+            self.concat = Qwen3TTSFusedStep.makeConcat(q: q, k: k, v: v, gate: gate, up: up)
             self.inputNorm = inputNorm.weight; self.postNorm = postNorm.weight
             self.qNorm = qNorm.weight; self.kNorm = kNorm.weight
             self.q = q; self.k = k; self.v = v; self.o = o
@@ -73,50 +100,45 @@ enum Qwen3TTSFusedStep {
     enum Mode { case hybrid, customMatvec }
     nonisolated(unsafe) static var mode: Mode = .hybrid
 
-    /// Concatenated projections, built once per layer (keyed by the q weight)
-    /// so one matmul launch serves q/k/v and one serves gate/up.
+    /// Concatenated projections, built once per layer at `Layer` init, so
+    /// one matmul launch serves q/k/v and one serves gate/up.
     struct Concat { let qkvW: MLXArray, qkvS: MLXArray, qkvB: MLXArray, guW: MLXArray, guS: MLXArray, guB: MLXArray }
-    private nonisolated(unsafe) static var concats: [ObjectIdentifier: Concat] = [:]
-    private static let concatsLock = NSLock()
 
-    static func concat(for layer: Layer) -> Concat {
-        let key = ObjectIdentifier(layer.q.weight)
-        concatsLock.lock(); defer { concatsLock.unlock() }
-        if let c = concats[key] { return c }
+    static func makeConcat(q: Layer.Projection, k: Layer.Projection, v: Layer.Projection,
+                           gate: Layer.Projection, up: Layer.Projection) -> Concat {
         let c = Concat(
-            qkvW: concatenated([layer.q.weight, layer.k.weight, layer.v.weight], axis: 0),
-            qkvS: concatenated([layer.q.scales, layer.k.scales, layer.v.scales], axis: 0),
-            qkvB: concatenated([layer.q.biases, layer.k.biases, layer.v.biases], axis: 0),
-            guW: concatenated([layer.gate.weight, layer.up.weight], axis: 0),
-            guS: concatenated([layer.gate.scales, layer.up.scales], axis: 0),
-            guB: concatenated([layer.gate.biases, layer.up.biases], axis: 0))
+            qkvW: concatenated([q.weight, k.weight, v.weight], axis: 0),
+            qkvS: concatenated([q.scales, k.scales, v.scales], axis: 0),
+            qkvB: concatenated([q.biases, k.biases, v.biases], axis: 0),
+            guW: concatenated([gate.weight, up.weight], axis: 0),
+            guS: concatenated([gate.scales, up.scales], axis: 0),
+            guB: concatenated([gate.biases, up.biases], axis: 0))
         eval(c.qkvW, c.qkvS, c.qkvB, c.guW, c.guS, c.guB)
         // Hand the layer's own tensors row-slices of the concatenations (views
         // over the same buffers) so the originals are freed: otherwise the
         // fused path carries +5 MB per layer (+165 MB on the 0.6B), which on
         // the iPhone 15 Pro was the difference between surviving the ~1.3 GB
         // transient of a 2 s decode chunk on long text and being jetsammed
-        // (2026-09-09). The module path (prefill) keeps working on the views,
-        // and the cache key (the q weight's identity) is unchanged.
-        let (nq, nk) = (layer.q.scales.dim(0), layer.k.scales.dim(0))
-        let nv = layer.v.scales.dim(0)
-        let ni = layer.gate.scales.dim(0)
+        // (2026-09-09). The module path (prefill) keeps working on the views.
+        let (nq, nk) = (q.scales.dim(0), k.scales.dim(0))
+        let nv = v.scales.dim(0)
+        let ni = gate.scales.dim(0)
         func adopt(_ p: Layer.Projection, _ w: MLXArray, _ sc: MLXArray, _ b: MLXArray, _ range: Range<Int>) {
             let (ws, ss, bs) = (w[range], sc[range], b[range])
             eval(ws, ss, bs)
             p.weight._updateInternal(ws); p.scales._updateInternal(ss); p.biases._updateInternal(bs)
         }
-        adopt(layer.q, c.qkvW, c.qkvS, c.qkvB, 0 ..< nq)
-        adopt(layer.k, c.qkvW, c.qkvS, c.qkvB, nq ..< nq + nk)
-        adopt(layer.v, c.qkvW, c.qkvS, c.qkvB, nq + nk ..< nq + nk + nv)
-        adopt(layer.gate, c.guW, c.guS, c.guB, 0 ..< ni)
-        adopt(layer.up, c.guW, c.guS, c.guB, ni ..< 2 * ni)
-        concats[key] = c
+        adopt(q, c.qkvW, c.qkvS, c.qkvB, 0 ..< nq)
+        adopt(k, c.qkvW, c.qkvS, c.qkvB, nq ..< nq + nk)
+        adopt(v, c.qkvW, c.qkvS, c.qkvB, nq + nk ..< nq + nk + nv)
+        adopt(gate, c.guW, c.guS, c.guB, 0 ..< ni)
+        adopt(up, c.guW, c.guS, c.guB, ni ..< 2 * ni)
         return c
     }
 
-    private static func qmm(_ x: MLXArray, _ w: MLXArray, _ s: MLXArray, _ b: MLXArray) -> MLXArray {
-        quantizedMM(x, w, scales: s, biases: b, transpose: true, groupSize: 64, bits: 4, mode: .affine)
+    private static func qmm(_ x: MLXArray, _ w: MLXArray, _ s: MLXArray, _ b: MLXArray, _ layer: Layer) -> MLXArray {
+        quantizedMM(x, w, scales: s, biases: b, transpose: true,
+                    groupSize: layer.groupSize, bits: layer.bits, mode: .affine)
     }
 
     /// The hybrid step (see `Mode`).
@@ -126,12 +148,12 @@ enum Qwen3TTSFusedStep {
         let hidden = x.dim(2)
         let intermediate = layer.gate.scales.dim(0)
         let (h, d) = (layer.numHeads, layer.numKvHeads)
-        let c = concat(for: layer)
+        let c = layer.concat
         let params = MLXArray([layer.eps, layer.ropeTheta])
         let position = MLXArray([Int32(cache?.offset ?? 0)])
 
         let normed = MLXFast.rmsNorm(x, weight: layer.inputNorm, eps: layer.eps)
-        let qkv = qmm(normed, c.qkvW, c.qkvS, c.qkvB)                       // (1, 1, (h+2d)·128)
+        let qkv = qmm(normed, c.qkvW, c.qkvS, c.qkvB, layer)                // (1, 1, (h+2d)·128)
         let split = kernel(.qkvPost, dtype: qkv.dtype, paramType: paramType, k: hidden, nt: 128, nq: h, nkv: d)(
             [qkv, layer.qNorm, layer.kNorm, params, position],
             grid: ((h + 2 * d) * 128, 1, 1), threadGroup: (128, 1, 1),
@@ -140,17 +162,17 @@ enum Qwen3TTSFusedStep {
         var (q, k, v) = (split[0], split[1], split[2])
         if let cache { (k, v) = cache.update(keys: k, values: v) }
         let attended = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: layer.scale, mask: nil)
-        let o = qmm(attended.reshaped(1, 1, h * headDim).asType(dtype), layer.o.weight, layer.o.scales, layer.o.biases)
+        let o = qmm(attended.reshaped(1, 1, h * headDim).asType(dtype), layer.o.weight, layer.o.scales, layer.o.biases, layer)
         let addNorm = kernel(.addNorm, dtype: dtype, paramType: paramType, k: hidden, nt: 256, xType: o.dtype)(
             [x, o, layer.postNorm, params],
             grid: (256, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 1, hidden], [1, 1, hidden]], outputDTypes: [dtype, dtype])
         let (afterAttention, postNormed) = (addNorm[0], addNorm[1])
-        let gu = qmm(postNormed, c.guW, c.guS, c.guB)                        // (1, 1, 2·intermediate)
+        let gu = qmm(postNormed, c.guW, c.guS, c.guB, layer)                 // (1, 1, 2·intermediate)
         let activated = kernel(.siluMul, dtype: gu.dtype, paramType: paramType, k: intermediate, nt: 256)(
             [gu], grid: (intermediate, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[1, 1, intermediate]], outputDTypes: [gu.dtype])[0]
-        let down = qmm(activated, layer.down.weight, layer.down.scales, layer.down.biases)
+        let down = qmm(activated, layer.down.weight, layer.down.scales, layer.down.biases, layer)
         return afterAttention + down
     }
     /// Threads per group. qkv needs a whole head (128 rows) per group for
@@ -164,7 +186,7 @@ enum Qwen3TTSFusedStep {
 
     /// `x` is (1, 1, hidden). Returns the layer output in the same shape.
     static func run(_ x: MLXArray, layer: Layer, cache: (any KVCache)?) -> MLXArray {
-        if mode == .hybrid { return runHybrid(x, layer: layer, cache: cache) }
+        if mode == .hybrid || !layer.customMatvecCapable { return runHybrid(x, layer: layer, cache: cache) }
         let dtype = x.dtype
         let paramType = layer.inputNorm.dtype
         let hidden = x.dim(2)
@@ -543,26 +565,33 @@ enum Qwen3TTSFusedStep {
 
 extension TalkerDecoderLayer {
     /// The fused-step view of this layer, or nil when its weights are not in
-    /// the layout the kernels take (then the module path runs).
+    /// the layout the step takes (then the module path runs). Resolved once
+    /// per layer: building it concatenates the projections (`makeConcat`).
     func fusedLayer() -> Qwen3TTSFusedStep.Layer? {
-        Qwen3TTSFusedStep.Layer(
+        if fusedLayerResolved { return fusedLayerCache }
+        fusedLayerResolved = true
+        fusedLayerCache = Qwen3TTSFusedStep.Layer(
             inputNorm: inputLayernorm, postNorm: postAttentionLayernorm,
             qNorm: selfAttn.qNorm, kNorm: selfAttn.kNorm,
             q: selfAttn.qProj, k: selfAttn.kProj, v: selfAttn.vProj, o: selfAttn.oProj,
             gate: mlp.gateProj, up: mlp.upProj, down: mlp.downProj,
             numHeads: selfAttn.numHeads, numKvHeads: selfAttn.numKvHeads, headDim: selfAttn.headDim,
             eps: inputLayernorm.eps, ropeTheta: selfAttn.ropeTheta, scale: selfAttn.scale)
+        return fusedLayerCache
     }
 }
 
 extension CodePredictorDecoderLayer {
     func fusedLayer() -> Qwen3TTSFusedStep.Layer? {
-        Qwen3TTSFusedStep.Layer(
+        if fusedLayerResolved { return fusedLayerCache }
+        fusedLayerResolved = true
+        fusedLayerCache = Qwen3TTSFusedStep.Layer(
             inputNorm: inputLayernorm, postNorm: postAttentionLayernorm,
             qNorm: selfAttn.qNorm, kNorm: selfAttn.kNorm,
             q: selfAttn.qProj, k: selfAttn.kProj, v: selfAttn.vProj, o: selfAttn.oProj,
             gate: mlp.gateProj, up: mlp.upProj, down: mlp.downProj,
             numHeads: selfAttn.numHeads, numKvHeads: selfAttn.numKvHeads, headDim: selfAttn.headDim,
             eps: inputLayernorm.eps, ropeTheta: selfAttn.ropeTheta, scale: selfAttn.scale)
+        return fusedLayerCache
     }
 }
