@@ -1038,7 +1038,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         return (inputEmbeds, trailingTextHidden, ttsPadEmbed, refCodes)
     }
 
-    func extractSpeakerEmbedding(_ refAudio: MLXArray) -> MLXArray? {
+    public func extractSpeakerEmbedding(_ refAudio: MLXArray) -> MLXArray? {
         guard let speakerEncoder else { return nil }
 
         let rawAudio: MLXArray
