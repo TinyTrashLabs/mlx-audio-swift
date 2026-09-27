@@ -161,7 +161,8 @@ public enum TTS {
             return try await load(
                 source,
                 modelType: resolvedType,
-                pretrained: { try await Dia2Model.fromPretrained($0, cache: $1) }
+                pretrained: { try await Dia2Model.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try await Dia2Model.load(from: modelDir) }
             )
         case "soprano_tts", "soprano":
             return try await load(
@@ -258,13 +259,32 @@ public enum TTS {
         guard let config = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        return (config["model_type"] as? String)
+        let declaredType = (config["model_type"] as? String)
             ?? (config["architecture"] as? String)
             ?? (config["model_version"] as? String)
+        if declaredType != nil { return declaredType }
+
+        // Dia2 ships its native config directly instead of wrapping it in the
+        // Transformers-style root `model_type` field used by most models.
+        if let dataConfig = config["data"] as? [String: Any],
+           let modelConfig = config["model"] as? [String: Any],
+           config["runtime"] is [String: Any],
+           dataConfig["channels"] != nil,
+           dataConfig["text_vocab_size"] != nil,
+           dataConfig["audio_vocab_size"] != nil,
+           modelConfig["decoder"] != nil,
+           modelConfig["depformer"] != nil
+        {
+            return "dia2"
+        }
+        return nil
     }
 
     private static func inferModelType(from modelRepo: String) -> String? {
         let lower = modelRepo.lowercased()
+        if lower.contains("dia2") || lower.contains("dia-2") {
+            return "dia2"
+        }
         if lower.contains("qwen3_tts") {
             return "qwen3_tts"
         }

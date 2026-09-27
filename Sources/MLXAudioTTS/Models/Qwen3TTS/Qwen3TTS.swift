@@ -27,6 +27,80 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     public var sampleRate: Int { config.sampleRate }
 
+    /// Loop profiling (iOS speed spike, 2026-09-08). When on, the generation
+    /// loop forces an eval at each stage boundary and accumulates wall time
+    /// per stage in `loopProfile` (seconds) plus `loopProfileFrames`. Costs a
+    /// little throughput itself, so leave it off in production.
+    public nonisolated(unsafe) static var profileLoop = false
+    /// Code-predictor step strategy: 0 = KV cache (upstream), 1 = cache-free
+    /// eager over the prefix, 2 = cache-free compiled with the module as
+    /// compile state, 3 = cache-free compiled with the weights captured as
+    /// constants (see `Qwen3TTSCodePredictor.compiledLogits`). 0 until measured.
+    public nonisolated(unsafe) static var codePredictorMode = 0
+    /// Rotate q/k with MLXFast.RoPE (one kernel each) instead of the
+    /// slice/negate/concat/multiply/add chain. On by default since 2026-09-09:
+    /// besides ~1,400 fewer launches a frame, the kernel is the more accurate
+    /// path — against an exact host RoPE it is within 2e-4 at position 1000,
+    /// while the module chain (MLX pow/cos/sin) drifts to 0.02 at position 9
+    /// and 0.20 at position 200 on |q| ≈ 3 (QwenRopeParityTests).
+    public nonisolated(unsafe) static var fastRope = true
+    /// Skip the every-50-steps Metal cache flush inside the loop (the caller
+    /// bounds the cache with `Memory.cacheLimit` anyway).
+    public nonisolated(unsafe) static var skipLoopCacheClear = false
+    /// Greedy (argmax) sub-codebooks 1…15; only the first codebook samples.
+    public nonisolated(unsafe) static var greedySubCodes = false
+    /// Streaming decode off the generation thread: 0 = inline (upstream),
+    /// 1 = a serial background queue on the same GPU stream (the loop no
+    /// longer waits for the decoder's GPU work), 2 = same, on a fresh GPU
+    /// stream per chunk so the decoder can overlap the loop's dispatch gaps.
+    public nonisolated(unsafe) static var asyncDecode = 0
+    /// Pipeline the frame (Mac profile, 2026-09-18): dispatch the talker's
+    /// graph as soon as it is built, and each code-predictor sub-step's as
+    /// soon as its token is sampled, so the GPU runs stage k while Swift
+    /// builds stage k+1. Upstream builds the whole frame (~2,400 lazy ops)
+    /// and evals once, which leaves the GPU idle during the build and the
+    /// CPU idle during the drain. Bit-exact with the same seed: the graph
+    /// is unchanged, only when it is committed.
+    public nonisolated(unsafe) static var pipelineFrame = false
+    /// Single-token decoder layers run as the fused step (see
+    /// `Qwen3TTSFusedStep`: MLX quantized matmuls plus custom glue kernels)
+    /// instead of ~22 MLX launches. Prefill, and any layer whose weights are
+    /// not 4- or 8-bit affine without biases, keep the module path.
+    public nonisolated(unsafe) static var fusedLayers = false
+    public nonisolated(unsafe) static var loopProfile: [String: Double] = [:]
+    public nonisolated(unsafe) static var loopProfileFrames = 0
+    /// Stop diagnostics (stop-variance probe, 2026-09-09): read-only
+    /// telemetry about the most recent generation loop. `lastTextExhaustedFrame`
+    /// is the step at which the trailing text ran out and `ttsPadEmbed` began
+    /// feeding the talker (0 for the ICL path, which prefills the whole text).
+    public enum StopReason: String { case eos, maxTokens, trailingSilence }
+    public nonisolated(unsafe) static var lastStopReason: StopReason?
+    public nonisolated(unsafe) static var lastFrameCount = 0
+    public nonisolated(unsafe) static var lastTextExhaustedFrame: Int?
+    public nonisolated(unsafe) static var lastEffectiveMaxTokens = 0
+    /// Optional per-frame probe: (frame, log P(EOS) under the talker's raw
+    /// logits, sampled first-codebook token). Forces an extra eval per frame,
+    /// so leave it nil outside diagnostics.
+    public nonisolated(unsafe) static var stopProbe: ((Int, Float, Int) -> Void)?
+    /// Added to the codec-EOS logit before sampling (0 = upstream). Positive
+    /// values make the talker stop sooner once it wants to; the stop-variance
+    /// probe uses large negative values to force a missed EOS and watch what
+    /// the talker does afterwards.
+    public nonisolated(unsafe) static var eosLogitBias: Float = 0
+    /// Stop as soon as EOS is the talker's single most likely token, even if
+    /// the sampler drew something else. Default off (upstream samples EOS
+    /// like any other token, so a run can miss its exit and never recover).
+    public nonisolated(unsafe) static var eosGreedyStop = false
+    /// Streaming only: once the decoded audio has trailed off into this many
+    /// seconds of continuous near-silence (below `trailingSilenceFloorDb`)
+    /// after speech was heard, stop generating. 0 = off (upstream). Bounds
+    /// the "hiss to the token cap" failure the phone produced at 25.44 s.
+    public nonisolated(unsafe) static var trailingSilenceStopSeconds: Double = 0
+    public nonisolated(unsafe) static var trailingSilenceFloorDb: Float = -35
+    private static func profileAdd(_ key: String, _ seconds: Double) {
+        loopProfile[key, default: 0] += seconds
+    }
+
     public var defaultGenerationParameters: GenerateParameters {
         GenerateParameters(
             maxTokens: 4096,
@@ -455,11 +529,36 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let codecTokenRateHz = 12.5
         let streamingChunkSize = max(1, Int(streamingInterval * codecTokenRateHz))
         var decodedTokens = 0
+        // Trailing-silence stop (see `trailingSilenceStopSeconds`). Shared
+        // with the async decode queue, which notes chunks off the loop's
+        // thread (before 2026-09-18 that path skipped the check entirely,
+        // so enabling `asyncDecode` silently disabled the backstop).
+        let silence = TrailingSilenceTracker(sampleRate: sampleRate)
 
         var trailingIdx = 0
         var inputEmbeds = inputEmbedsInit
         let eosTokenArray = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
         let codeCache = talker.codePredictor.makeCache()
+
+        // Async streaming decode (see `asyncDecode`): chunks decode on this
+        // serial queue in order; the loop only evals the codes it hands over.
+        let decodeQueue = DispatchQueue(label: "qwen3tts.streaming-decode", qos: .userInitiated)
+        func decodeChunkAsync(_ codesForDecoder: MLXArray, _ onAudioChunk: @escaping (MLXArray) -> Void) {
+            decodeQueue.async {
+                let work = {
+                    let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
+                    let audioChunk = decoded[0]
+                    eval(audioChunk)
+                    onAudioChunk(audioChunk)
+                    if Self.trailingSilenceStopSeconds > 0 { silence.note(audioChunk) }
+                }
+                if Self.asyncDecode == 2 {
+                    Stream.withNewDefaultStream(device: Device(.gpu), work)
+                } else {
+                    work()
+                }
+            }
+        }
 
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
@@ -470,10 +569,19 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             }
         }
 
+        let profiling = Self.profileLoop
+        if profiling { Self.loopProfile = [:]; Self.loopProfileFrames = 0 }
+        Self.lastStopReason = nil
+        Self.lastFrameCount = 0
+        Self.lastTextExhaustedFrame = trailingTextHidden.dim(1) == 0 ? 0 : nil
+        Self.lastEffectiveMaxTokens = effectiveMaxTokens
         for step in 0 ..< effectiveMaxTokens {
             try Task.checkCancellation()
+            var stageStart = Date()
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
+            if Self.pipelineFrame { asyncEval(logits, hidden) }
+            if profiling { eval(logits, hidden); Self.profileAdd("talker", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Sample first codebook token
             let nextToken = sampleToken(
@@ -485,11 +593,18 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 generatedTokens: generatedCodebookTokens,
                 suppressTokens: suppressTokens,
                 eosTokenId: eosTokenId,
-                minP: minP
+                minP: minP,
+                eosLogitBias: Self.eosLogitBias
             )
 
+            if profiling { eval(nextToken); Self.profileAdd("sample0", Date().timeIntervalSince(stageStart)); stageStart = Date() }
+
             // Defer sync to the eval boundary with inputEmbeds.
-            let isEOS = nextToken .== eosTokenArray
+            var isEOS = nextToken .== eosTokenArray
+            if Self.eosGreedyStop {
+                let greedy = argMax(logits[0..., (-1)..., 0...], axis: -1) // [1, 1]
+                isEOS = logicalOr(isEOS, greedy .== eosTokenArray)
+            }
 
             // Generate remaining codebook tokens with code predictor
             var codeTokens = [nextToken]
@@ -498,6 +613,30 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 _ = layerCache.trim(layerCache.offset)
             }
 
+            if Self.codePredictorMode > 0 {
+                // Prefix grows by one embedding per step; each step is one
+                // compiled graph over the whole (tiny) prefix.
+                var prefix = concatenated([codeHidden, talker.getInputEmbeddings()(nextToken)], axis: 1)
+                for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
+                    if codeIdx > 0 {
+                        prefix = concatenated(
+                            [prefix, talker.codePredictor.codecEmbedding[codeIdx - 1](codeTokens.last!)], axis: 1)
+                    }
+                    let codeLogits = Self.codePredictorMode >= 2
+                        ? talker.codePredictor.compiledLogits(prefix: prefix, step: codeIdx,
+                                                              withState: Self.codePredictorMode == 2)
+                        : talker.codePredictor.logitsNoCache(prefix: prefix, step: codeIdx)
+                    let nextCode = sampleToken(
+                        codeLogits,
+                        temperature: Self.greedySubCodes ? 0 : temperature,
+                        topP: topP,
+                        topK: topK,
+                        minP: minP
+                    )
+                    codeTokens.append(nextCode)
+                    if Self.pipelineFrame { asyncEval(nextCode) }
+                }
+            } else {
             for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
                 let codeInput: MLXArray
                 if codeIdx == 0 {
@@ -513,21 +652,25 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
                 let nextCode = sampleToken(
                     codeLogits,
-                    temperature: temperature,
+                    temperature: Self.greedySubCodes ? 0 : temperature,
                     topP: topP,
                     topK: topK,
                     minP: minP
                 )
                 codeTokens.append(nextCode)
+                if Self.pipelineFrame { asyncEval(nextCode) }
+            }
             }
 
             let allCodes = concatenated(codeTokens, axis: 1) // [1, num_code_groups]
+            if profiling { eval(allCodes); Self.profileAdd("codePredictor", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Prepare next input
             let textEmbed: MLXArray
             if trailingIdx < trailingTextHidden.dim(1) {
                 textEmbed = trailingTextHidden[0..., trailingIdx ..< (trailingIdx + 1), 0...]
                 trailingIdx += 1
+                if trailingIdx == trailingTextHidden.dim(1) { Self.lastTextExhaustedFrame = step }
             } else {
                 textEmbed = ttsPadEmbed
             }
@@ -540,10 +683,16 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
             inputEmbeds = textEmbed + codecEmbed
             eval(inputEmbeds, isEOS)
+            if profiling { Self.profileAdd("nextInput", Date().timeIntervalSince(stageStart)); stageStart = Date(); Self.loopProfileFrames += 1 }
 
             let tokenId = Int(nextToken[0, 0].item(Int32.self))
+            if let probe = Self.stopProbe {
+                let logProbs = logSoftmax(logits[0..., (-1)..., 0...].squeezed(axis: 1).asType(.float32), axis: -1)
+                probe(step, logProbs[0, eosTokenId].item(Float.self), tokenId)
+            }
             onToken?(tokenId)
             if isEOS.item(Bool.self) {
+                Self.lastStopReason = .eos
                 break
             }
             generatedCodebookTokens.append(tokenId)
@@ -556,21 +705,35 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     let codesChunk = stacked(Array(generatedCodes[decodedTokens...]), axis: 1)
                     let codesForDecoder = codesChunk.transposed(0, 2, 1)
                     eval(codesForDecoder)
-                    let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
-                    let audioChunk = decoded[0]
-                    eval(audioChunk)
-
                     decodedTokens = generatedCodes.count
-                    onAudioChunk(audioChunk)
+                    if Self.asyncDecode > 0 {
+                        decodeChunkAsync(codesForDecoder, onAudioChunk)
+                    } else {
+                        let decoded = speechTokenizer.decoder.streamingStep(codesForDecoder).squeezed(axis: 1)
+                        let audioChunk = decoded[0]
+                        eval(audioChunk)
+                        onAudioChunk(audioChunk)
+                        if Self.trailingSilenceStopSeconds > 0 { silence.note(audioChunk) }
+                    }
+                    // On the async path this reflects the chunks decoded so
+                    // far, so the stop lands a chunk late at worst.
+                    if Self.trailingSilenceStopSeconds > 0,
+                       silence.trailingSeconds(afterSpeech: true) >= Self.trailingSilenceStopSeconds {
+                        Self.lastStopReason = .trailingSilence
+                        break
+                    }
+                    if profiling { Self.profileAdd("decode", Date().timeIntervalSince(stageStart)); stageStart = Date() }
                 }
             }
 
-            if step > 0, step % 50 == 0 {
+            if step > 0, step % 50 == 0, !Self.skipLoopCacheClear {
                 Memory.clearCache()
             }
         }
 
         try Task.checkCancellation()
+        if Self.lastStopReason == nil { Self.lastStopReason = .maxTokens }
+        Self.lastFrameCount = generatedCodes.count
 
         guard !generatedCodes.isEmpty else {
             return MLXArray.zeros([1])
@@ -592,6 +755,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         // Streaming path: yield remaining tokens and return early
         if let onAudioChunk {
+            // Every queued chunk lands, in order, before the tail decodes.
+            if Self.asyncDecode > 0 { decodeQueue.sync {} }
             if generatedCodes.count > decodedTokens {
                 let codesChunk = stacked(Array(generatedCodes[decodedTokens...]), axis: 1)
                 let codesForDecoder = codesChunk.transposed(0, 2, 1)
@@ -873,7 +1038,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         return (inputEmbeds, trailingTextHidden, ttsPadEmbed, refCodes)
     }
 
-    func extractSpeakerEmbedding(_ refAudio: MLXArray) -> MLXArray? {
+    public func extractSpeakerEmbedding(_ refAudio: MLXArray) -> MLXArray? {
         guard let speakerEncoder else { return nil }
 
         let rawAudio: MLXArray
@@ -1046,9 +1211,16 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         generatedTokens: [Int]? = nil,
         suppressTokens: [Int]? = nil,
         eosTokenId: Int? = nil,
-        minP: Float = 0.0
+        minP: Float = 0.0,
+        eosLogitBias: Float = 0
     ) -> MLXArray {
         var logitsSlice = logits[0..., (-1)..., 0...].squeezed(axis: 1) // [batch, vocab_size]
+
+        if eosLogitBias != 0, let eosTokenId, eosTokenId >= 0, eosTokenId < logitsSlice.dim(-1) {
+            let eosIdx = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
+            let biased = takeAlong(logitsSlice, eosIdx, axis: -1) + MLXArray(eosLogitBias).asType(logitsSlice.dtype)
+            logitsSlice = putAlong(logitsSlice, eosIdx, values: biased, axis: -1)
+        }
 
         // Suppress tokens by setting to -inf
         if let suppress = suppressTokens, !suppress.isEmpty {
@@ -1452,5 +1624,40 @@ enum Qwen3DecodePacing {
             return value
         }
         return nil
+    }
+}
+
+/// Seconds of near-silence at the end of the audio streamed so far, and
+/// whether anything above the floor has been heard yet. Locked, because the
+/// async decode queue notes chunks while the generation loop reads.
+final class TrailingSilenceTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private let sampleRate: Int
+    private var trailing = 0.0
+    private var heardSpeech = false
+
+    init(sampleRate: Int) { self.sampleRate = sampleRate }
+
+    func note(_ audioChunk: MLXArray) {
+        let windowLen = max(1, sampleRate / 50) // 20 ms
+        let windows = audioChunk.dim(0) / windowLen
+        guard windows > 0 else { return }
+        let frames = audioChunk[0 ..< (windows * windowLen)].reshaped(windows, windowLen).asType(.float32)
+        let rmsDb = 20 * log10(sqrt(mean(square(frames), axis: -1)) + 1e-9)
+        let loud = (rmsDb .> Qwen3TTSModel.trailingSilenceFloorDb).asArray(Bool.self)
+        lock.lock(); defer { lock.unlock() }
+        if let lastLoud = loud.lastIndex(of: true) {
+            heardSpeech = true
+            trailing = Double(windows - 1 - lastLoud) * Double(windowLen) / Double(sampleRate)
+        } else {
+            trailing += Double(windows * windowLen) / Double(sampleRate)
+        }
+    }
+
+    /// Trailing near-silence in seconds; 0 until speech has been heard when
+    /// `afterSpeech` is set (leading silence never counts as a tail).
+    func trailingSeconds(afterSpeech: Bool) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return afterSpeech && !heardSpeech ? 0 : trailing
     }
 }

@@ -16,6 +16,7 @@ final class CodePredictorAttention: Module {
     let numKvHeads: Int
     let headDim: Int
     let scale: Float
+    let ropeTheta: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -29,6 +30,7 @@ final class CodePredictorAttention: Module {
         self.numKvHeads = config.numKeyValueHeads
         self.headDim = config.headDim
         self.scale = 1.0 / Foundation.sqrt(Float(headDim))
+        self.ropeTheta = config.ropeTheta
 
         _qProj.wrappedValue = Linear(config.hiddenSize, numHeads * headDim, bias: config.attentionBias)
         _kProj.wrappedValue = Linear(config.hiddenSize, numKvHeads * headDim, bias: config.attentionBias)
@@ -57,11 +59,17 @@ final class CodePredictorAttention: Module {
         k = k.transposed(0, 2, 1, 3)
         v = v.transposed(0, 2, 1, 3)
 
-        let (cosVal, sinVal) = positionEmbeddings
-        let cosE = expandedDimensions(cosVal, axis: 1)
-        let sinE = expandedDimensions(sinVal, axis: 1)
-        q = q * cosE + cpRotateHalf(q) * sinE
-        k = k * cosE + cpRotateHalf(k) * sinE
+        if Qwen3TTSModel.fastRope {
+            let offset = cache?.offset ?? 0
+            q = MLXFast.RoPE(q, dimensions: headDim, traditional: false, base: ropeTheta, scale: 1, offset: offset)
+            k = MLXFast.RoPE(k, dimensions: headDim, traditional: false, base: ropeTheta, scale: 1, offset: offset)
+        } else {
+            let (cosVal, sinVal) = positionEmbeddings
+            let cosE = expandedDimensions(cosVal, axis: 1)
+            let sinE = expandedDimensions(sinVal, axis: 1)
+            q = q * cosE + cpRotateHalf(q) * sinE
+            k = k * cosE + cpRotateHalf(k) * sinE
+        }
 
         if let cache {
             (k, v) = cache.update(keys: k, values: v)
@@ -102,6 +110,11 @@ final class CodePredictorMLP: Module {
 // MARK: - Code Predictor Decoder Layer
 
 final class CodePredictorDecoderLayer: Module {
+    /// `fusedLayer()`'s once-per-layer result (nil when the weights are not
+    /// fusable); resolved on first use, after the weights are loaded. Plain
+    /// stored properties, so Module's reflection ignores them.
+    var fusedLayerCache: Qwen3TTSFusedStep.Layer?
+    var fusedLayerResolved = false
     @ModuleInfo(key: "self_attn") var selfAttn: CodePredictorAttention
     @ModuleInfo var mlp: CodePredictorMLP
     @ModuleInfo(key: "input_layernorm") var inputLayernorm: RMSNorm
@@ -120,6 +133,9 @@ final class CodePredictorDecoderLayer: Module {
         mask: MLXArray? = nil,
         cache: (any KVCache)? = nil
     ) -> MLXArray {
+        if Qwen3TTSModel.fusedLayers, x.dim(0) == 1, x.dim(1) == 1, let fused = fusedLayer() {
+            return Qwen3TTSFusedStep.run(x, layer: fused, cache: cache)
+        }
         var out = x + selfAttn(inputLayernorm(x), positionEmbeddings: positionEmbeddings, mask: mask, cache: cache)
         out = out + mlp(postAttentionLayernorm(out))
         return out
@@ -171,7 +187,9 @@ final class CodePredictorModel: Module {
             posIds = broadcast(pos, to: [batch, seqLen])
         }
 
-        let posEmbeddings = rotaryEmb(inputsEmbeds, positionIds: posIds)
+        let posEmbeddings = Qwen3TTSModel.fastRope
+            ? (inputsEmbeds, inputsEmbeds)   // unused; the layers rotate in-kernel
+            : rotaryEmb(inputsEmbeds, positionIds: posIds)
 
         var causalMask = mask
         if causalMask == nil, seqLen > 1 {
@@ -235,6 +253,50 @@ final class Qwen3TTSCodePredictor: Module {
         let x = model(embeds, positionIds: positionIds, mask: mask, cache: cache)
         let logits = lmHead[generationStep](x)
         return (logits, cache, generationStep + 1)
+    }
+
+    // MARK: Compiled, cache-free steps (iOS speed spike, 2026-09-08)
+    //
+    // With the KV cache each of the 15 sub-steps per frame is ~25 kernel
+    // launches per layer plus cache bookkeeping, and on an iPhone that
+    // overhead (not the math) is ~4.7 ms a step — 70 of the ~115 ms a frame
+    // costs. Recomputing attention over the whole prefix (at most 17 tokens)
+    // is trivial work and makes each step a pure function of the prefix, so
+    // it can be compiled: elementwise ops fuse and the graph is built once
+    // per (step, prefix length) and replayed. Mathematically identical to
+    // the cached path: causal attention over positions 0..<n, last row out.
+
+    private var compiledSteps: [Int: @Sendable (MLXArray) -> MLXArray] = [:]
+
+    /// Logits for sub-step `step` given the embedded prefix (1, n, H).
+    func logitsNoCache(prefix: MLXArray, step: Int) -> MLXArray {
+        var embeds = prefix
+        if let proj = projection { embeds = proj(embeds) }
+        let x = model(embeds, positionIds: nil, mask: nil, cache: nil)
+        return lmHead[step](x[0..., (-1)..., 0...])
+    }
+
+    /// The compiled form of `logitsNoCache`, one graph per step (each step
+    /// has its own lm head and prefix length).
+    ///
+    /// `withState`: pass the module as compile state (its parameters are
+    /// re-collected and checked on every call — measured at +30 ms a frame on
+    /// an iPhone), or capture the weights as trace-time constants (they never
+    /// change during generation).
+    func compiledLogits(prefix: MLXArray, step: Int, withState: Bool) -> MLXArray {
+        if let f = compiledSteps[step] { return f(prefix) }
+        let f: @Sendable (MLXArray) -> MLXArray
+        if withState {
+            f = compile(inputs: [self], outputs: [self]) { [unowned self] (prefix: MLXArray) -> MLXArray in
+                self.logitsNoCache(prefix: prefix, step: step)
+            }
+        } else {
+            f = compile { [unowned self] (prefix: MLXArray) -> MLXArray in
+                self.logitsNoCache(prefix: prefix, step: step)
+            }
+        }
+        compiledSteps[step] = f
+        return f(prefix)
     }
 
     func makeCache() -> [any KVCache] {

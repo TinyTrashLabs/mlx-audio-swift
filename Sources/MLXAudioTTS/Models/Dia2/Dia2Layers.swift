@@ -14,6 +14,18 @@ import MLXNN
 final class Dia2RoPE {
     private let cosCache: MLXArray
     private let sinCache: MLXArray
+    /// Exposed so the sizing invariant can be asserted in tests.
+    let rows: Int
+
+    /// Rows needed to cover every position generation can reach for a model
+    /// with `contextSteps` of context. Generation runs `contextSteps` frames
+    /// starting at the prefix's last frame, so the highest position is
+    /// `prefixFrames + contextSteps`; a prefix cannot exceed the model's own
+    /// context, so `2 * contextSteps` bounds it. The extra 64 is slack the
+    /// port has always carried.
+    static func tableRows(forContextSteps contextSteps: Int) -> Int {
+        2 * contextSteps + 64
+    }
 
     init(headDim: Int, minTimescale: Int, maxTimescale: Float, maxSeqLen: Int) {
         precondition(headDim % 2 == 0, "RoPE dimension must be even")
@@ -30,14 +42,23 @@ final class Dia2RoPE {
         let emb = concatenated([freqs, freqs], axis: -1)   // [maxSeqLen, headDim]
         cosCache = cos(emb)
         sinCache = sin(emb)
+        rows = maxSeqLen
     }
 
     /// - Parameters:
     ///   - x: `[B, T, H, D]`
     ///   - positions: `[B, T]` of Int32
     func callAsFunction(_ x: MLXArray, positions: MLXArray) -> MLXArray {
-        let c = cosCache[positions].expandedDimensions(axis: 2).asType(x.dtype)  // [B,T,1,D]
-        let s = sinCache[positions].expandedDimensions(axis: 2).asType(x.dtype)
+        // MLX does not bounds-check a gather: `offset_neg_idx` folds negative
+        // indices and passes everything else straight through, so a position
+        // past the table reads whatever memory follows it. Clamping is still
+        // wrong -- two frames share one encoding -- but it is wrong in a bounded,
+        // reproducible way instead of returning uninitialised GPU memory. The
+        // table is sized so this never engages for any prefix the model can
+        // actually hold; see `Dia2Attention.init`.
+        let safe = minimum(positions, MLXArray(Int32(rows - 1)))
+        let c = cosCache[safe].expandedDimensions(axis: 2).asType(x.dtype)  // [B,T,1,D]
+        let s = sinCache[safe].expandedDimensions(axis: 2).asType(x.dtype)
         let d = x.dim(-1)
         let x1 = x[.ellipsis, 0 ..< (d / 2)]
         let x2 = x[.ellipsis, (d / 2) ..< d]
@@ -138,10 +159,24 @@ final class Dia2Attention: Module {
         _oProj.wrappedValue = Linear(numQueryHeads * headDim, dim, bias: false)
         _qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.model.normalizationLayerEpsilon)
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.model.normalizationLayerEpsilon)
+        // Generation runs `maxContextSteps` frames starting at `startStep`, and
+        // `startStep` is the prefix's frame count -- so positions reach
+        // `prefixFrames + maxContextSteps`, not `maxContextSteps`. Sizing the
+        // table to the latter meant every pass longer than
+        // `(maxContextSteps + 64 - prefixFrames)` frames indexed past its end:
+        // with 35s of reference audio (441 frames) that is ~90s of speech,
+        // after which the positional encoding is garbage and the model stops
+        // emitting words while the state machine force-feeds them at the
+        // max-padding cadence -- long silences with the script consumed.
+        // The reference sizes its decode state `limit + prefix_len + 1` for the
+        // same reason. A prefix cannot exceed the model's own context, so
+        // doubling covers every reachable position; the table is
+        // [rows, headDim] floats, a few MB.
         rope = Dia2RoPE(headDim: headDim,
                         minTimescale: config.model.ropeMinTimescale,
                         maxTimescale: config.model.ropeMaxTimescale,
-                        maxSeqLen: config.runtime.maxContextSteps + 64)
+                        maxSeqLen: Dia2RoPE.tableRows(
+                            forContextSteps: config.runtime.maxContextSteps))
         super.init()
     }
 
