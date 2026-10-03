@@ -1929,6 +1929,38 @@ struct BreezeTTSTests {
         #expect(BreezeTTSModel.defaultParameters.topK == 50)
     }
 
+    @Test func guidanceBranchesMatchUpstreamFormulas() {
+        typealias B = BreezeTTSModel.GuidanceBranch
+        func plan(_ ref: Bool, _ ins: String?, _ cfg: Float, _ r: Float?) -> [String] {
+            BreezeTTSModel.guidance(hasReference: ref, directive: ins, cfgScale: cfg, referenceScale: r)
+                .map { "\($0.branch):\($0.weight)" }
+        }
+        // Plain clone / plain design without guidance: the prompt as given.
+        #expect(plan(true, nil, 4, nil) == ["full:1.0"])
+        #expect(plan(false, "Warm", 1, nil) == ["full:1.0"])
+        // Single CFG: uncond + cfg·(cond − uncond) = cfg·cond + (1−cfg)·uncond.
+        #expect(plan(true, "Warm", 4, nil) == ["full:4.0", "withoutInstruction:-3.0"])
+        #expect(plan(false, "Warm", 4, nil) == ["full:4.0", "withoutInstruction:-3.0"])
+        // Dual CFG (upstream ref_edit_tata): uncond + ref·(ref − uncond) + ins·(ins − uncond).
+        #expect(plan(true, "Warm", 4, 2) ==
+                ["textOnly:-5.0", "withoutInstruction:2.0", "instructionOnly:4.0"])
+        // Identity strength without a Direction: uncond + ref·(ref − uncond).
+        #expect(plan(true, nil, 4, 2) == ["textOnly:-1.0", "withoutInstruction:2.0"])
+        // Strength 1 with nothing else to guide is the plain clone.
+        #expect(plan(true, nil, 4, 1) == ["full:1.0"])
+        // No reference: identity strength has nothing to act on.
+        #expect(plan(false, "Warm", 4, 2) == ["full:4.0", "withoutInstruction:-3.0"])
+        // Weights always sum to 1, so guidance never rescales the logits.
+        let cases: [(ref: Bool, ins: String?, cfg: Float, refScale: Float?)] = [
+            (true, "W", 4, 2), (true, nil, 3, 1.5), (false, "W", 6, nil),
+        ]
+        for c in cases {
+            let w = BreezeTTSModel.guidance(hasReference: c.ref, directive: c.ins, cfgScale: c.cfg,
+                                            referenceScale: c.refScale).map(\.weight)
+            #expect(abs(w.reduce(0, +) - 1) < 1e-6)
+        }
+    }
+
     @Test func samplerDefaultsMatchUpstreamInference() {
         // breeze-tts infer.py / api.py: temperature 0.9, top-k 50, top-p 1,
         // and a 1.1 repetition penalty on codebook 0. Without the penalty a

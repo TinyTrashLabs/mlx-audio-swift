@@ -28,6 +28,21 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
     public var cfgScaleOverride: Float?
     public static let defaultCFGScale: Float = 4
 
+    /// Identity strength: guidance toward the REFERENCE voice, from upstream's
+    /// dual-CFG path (`cfg_scale_ref`). nil = off, the single-CFG behaviour
+    /// above. When set on a cloned take, each frame is guided by three
+    /// prompts — text alone, the reference clone, and the instruction alone:
+    ///
+    ///     logits = uncond + ref·(clone − uncond) + cfg·(instructed − uncond)
+    ///
+    /// so the reference and the Direction get separate strengths. With no
+    /// instruction it reduces to `uncond + ref·(clone − uncond)`: plain
+    /// guidance toward the reference, for a clone whose accent or timbre
+    /// drifts. Upstream wires dual guidance only for directed clones; the
+    /// no-instruction form is this port's extension. Costs a third backbone
+    /// and depth-decoder pass per frame with a Direction, a second without.
+    public var referenceGuidanceOverride: Float?
+
     public var sampleRate: Int { config.sampleRate }
 
     public var defaultGenerationParameters: GenerateParameters { Self.defaultParameters }
@@ -97,6 +112,41 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
     /// scale of 1 (the Python reference's `cfg_scale not in (None, 1.0)`).
     static func usesGuidance(directive: String?, cfgScale: Float) -> Bool {
         directive != nil && cfgScale != 1
+    }
+
+    /// One prompt the decoder runs per frame, and how its logits are weighted.
+    enum GuidanceBranch: Equatable {
+        /// Reference (if any) + instruction (if any) + text: the request as given.
+        case full
+        /// The request without its instruction (single CFG's negative).
+        case withoutInstruction
+        /// The text alone: no reference, no instruction (dual CFG's uncond).
+        case textOnly
+        /// Instruction + text, no reference (dual CFG's `ins`).
+        case instructionOnly
+    }
+
+    /// The branches a take decodes and their weights; the frame's logits are
+    /// `Σ weight · logits(branch)`. Every mode is this one sum:
+    /// - plain:       `full`
+    /// - single CFG:  `cfg·full + (1−cfg)·withoutInstruction`
+    /// - dual CFG:    `(1−ref−cfg)·textOnly + ref·withoutInstruction + cfg·instructionOnly`
+    ///   (upstream's `uncond + ref·(ref − uncond) + cfg·(ins − uncond)`; with no
+    ///   reference the clone-without-instruction branch IS upstream's `ref`).
+    static func guidance(
+        hasReference: Bool, directive: String?, cfgScale: Float, referenceScale: Float?
+    ) -> [(branch: GuidanceBranch, weight: Float)] {
+        if hasReference, let ref = referenceScale {
+            let cfg: Float = directive == nil ? 0 : cfgScale
+            if directive == nil && ref == 1 { return [(.full, 1)] }
+            var branches: [(branch: GuidanceBranch, weight: Float)] = [
+                (.textOnly, 1 - ref - cfg), (.withoutInstruction, ref),
+            ]
+            if directive != nil { branches.append((.instructionOnly, cfg)) }
+            return branches
+        }
+        guard usesGuidance(directive: directive, cfgScale: cfgScale) else { return [(.full, 1)] }
+        return [(.full, cfgScale), (.withoutInstruction, 1 - cfgScale)]
     }
 
     static func promptText(text: String, instruction: String?) -> String {
@@ -209,25 +259,36 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             refAudio: refAudio,
             refText: refText
         )
-        let usesGuidance = Self.usesGuidance(
-            directive: directive, cfgScale: cfgScaleOverride ?? Self.defaultCFGScale)
-        let cfgScale = cfgScaleOverride ?? Self.defaultCFGScale
-        let unconditionalPrompt = usesGuidance
-            ? try promptEmbeddings(text: text, instruction: nil, refAudio: refAudio, refText: refText)
-            : nil
-
-        let conditionalCache = backboneModel.makeCache()
-        var conditionalHidden = backboneModel(
-            inputEmbeddings: conditionalPrompt,
-            cache: conditionalCache
-        )[0..., -1, 0...]
-        let unconditionalCache = unconditionalPrompt.map { _ in backboneModel.makeCache() }
-        var unconditionalHidden = zipOptional(unconditionalPrompt, unconditionalCache).map {
+        let plan = Self.guidance(
+            hasReference: refAudio != nil, directive: directive,
+            cfgScale: cfgScaleOverride ?? Self.defaultCFGScale,
+            referenceScale: referenceGuidanceOverride)
+        let weights = plan.map(\.weight)
+        let prompts: [MLXArray] = try plan.map { entry in
+            switch entry.branch {
+            case .full:
+                return conditionalPrompt
+            case .withoutInstruction:
+                return try promptEmbeddings(text: text, instruction: nil, refAudio: refAudio, refText: refText)
+            case .textOnly:
+                return try promptEmbeddings(text: text, instruction: nil, refAudio: nil, refText: nil)
+            case .instructionOnly:
+                return try promptEmbeddings(text: text, instruction: directive, refAudio: nil, refText: nil)
+            }
+        }
+        let caches = prompts.map { _ in backboneModel.makeCache() }
+        var hiddens = zip(prompts, caches).map {
             backboneModel(inputEmbeddings: $0.0, cache: $0.1)[0..., -1, 0...]
         }
-        eval(conditionalHidden)
-        if let unconditionalHidden { eval(unconditionalHidden) }
+        eval(hiddens)
         let prefillTime = Date().timeIntervalSince(started)
+        /// `Σ weight · logits(branch)`, skipping the arithmetic for one branch.
+        func guided(_ perBranch: (MLXArray) -> MLXArray) -> MLXArray {
+            if hiddens.count == 1 { return perBranch(hiddens[0]) }
+            var sum = weights[0] * perBranch(hiddens[0])
+            for i in 1..<hiddens.count { sum = sum + weights[i] * perBranch(hiddens[i]) }
+            return sum
+        }
 
         let sampler = parameters.temperature > 0
             ? TopPSampler(
@@ -242,11 +303,7 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
 
         for _ in 0..<maxTokens {
             if Task.isCancelled { throw CancellationError() }
-            var logits = lmHead(conditionalHidden)
-            if let unconditionalHidden {
-                let unconditioned = lmHead(unconditionalHidden)
-                logits = unconditioned + cfgScale * (logits - unconditioned)
-            }
+            var logits = guided { lmHead($0) }
             logits = applyRepetitionPenalty(
                 logits,
                 generatedTokens: frames.map { Int($0[0]) },
@@ -261,16 +318,8 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             var depthInputs = [Int32(0), Int32(first)]
             while frame.count < config.numCodebooks {
                 let ids = MLXArray(depthInputs).reshaped([1, depthInputs.count])
-                var depthLogits = depthDecoder.nextLogits(
-                    tokenIDs: ids,
-                    backboneHiddenState: conditionalHidden
-                )
-                if let unconditionalHidden {
-                    let unconditioned = depthDecoder.nextLogits(
-                        tokenIDs: ids,
-                        backboneHiddenState: unconditionalHidden
-                    )
-                    depthLogits = unconditioned + cfgScale * (depthLogits - unconditioned)
+                var depthLogits = guided {
+                    depthDecoder.nextLogits(tokenIDs: ids, backboneHiddenState: $0)
                 }
                 depthLogits = maskReservedTokens(depthLogits, allowsEOS: false)
                 let next = sample(depthLogits, sampler: sampler)
@@ -280,12 +329,10 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             frames.append(frame)
 
             let codebooks = MLXArray(frame).reshaped([1, 1, config.numCodebooks])
-            conditionalHidden = backboneModel(inputIDs: codebooks, cache: conditionalCache)[0..., -1, 0...]
-            if let cache = unconditionalCache {
-                unconditionalHidden = backboneModel(inputIDs: codebooks, cache: cache)[0..., -1, 0...]
+            hiddens = caches.map {
+                backboneModel(inputIDs: codebooks, cache: $0)[0..., -1, 0...]
             }
-            eval(conditionalHidden)
-            if let unconditionalHidden { eval(unconditionalHidden) }
+            eval(hiddens)
         }
 
         let audio: MLXArray
@@ -489,9 +536,4 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
         eval(tokenizer.parameters())
         return tokenizer
     }
-}
-
-private func zipOptional<A, B>(_ lhs: A?, _ rhs: B?) -> (A, B)? {
-    guard let lhs, let rhs else { return nil }
-    return (lhs, rhs)
 }
