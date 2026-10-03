@@ -562,6 +562,21 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
+            // ICL: run the reference codes through the streaming decoder first and drop their
+            // audio, so the line starts from the state the non-streaming path gets by decoding
+            // [ref + generated] and cutting the ref off. A cold decoder garbles the first ~1.5 s:
+            // Benson's first word came out an octave high (185-245 Hz vs 101-106 Hz), heard as a
+            // voice crack. On the async path this overlaps prefill and the first chunk.
+            if let refCodes {
+                let prime = { speechTokenizer.decoder.primeStreaming(refCodes) }
+                if Self.asyncDecode > 0 {
+                    decodeQueue.async {
+                        if Self.asyncDecode == 2 { Stream.withNewDefaultStream(device: Device(.gpu), prime) } else { prime() }
+                    }
+                } else {
+                    prime()
+                }
+            }
         }
         defer {
             if onAudioChunk != nil {
