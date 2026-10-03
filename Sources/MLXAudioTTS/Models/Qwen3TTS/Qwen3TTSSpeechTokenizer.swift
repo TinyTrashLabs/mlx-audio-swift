@@ -980,6 +980,30 @@ final class Qwen3TTSSpeechTokenizerDecoder: Module {
         hidden = preTransformer(hidden, cache: transformerCache)
         hidden = hidden.transposed(0, 2, 1) // [batch, latent_dim, time]
 
+        return streamingUpsample(hidden)
+    }
+
+    /// Warms the streaming state with left-context codes (an ICL reference) without keeping
+    /// their audio. The transformer sees every frame (its cache keeps all of them); the
+    /// upsampler and decoder convs only keep a short history, so just the last `tailFrames`
+    /// hidden frames go through them (8 frames covers their receptive field; this keeps the
+    /// warm-up to a fraction of a chunk's decode instead of decoding the whole reference).
+    func primeStreaming(_ codes: MLXArray, tailFrames: Int = 12) {
+        if transformerCache == nil {
+            transformerCache = preTransformer.makeCache()
+        }
+        var hidden = quantizer.decode(codes)
+        hidden = preConv.step(hidden)
+        hidden = hidden.transposed(0, 2, 1)
+        hidden = preTransformer(hidden, cache: transformerCache)
+        hidden = hidden.transposed(0, 2, 1)
+        let t = hidden.dim(2)
+        let k = min(tailFrames, t)
+        eval(streamingUpsample(hidden[0..., 0..., (t - k)...]))
+    }
+
+    private func streamingUpsample(_ hiddenIn: MLXArray) -> MLXArray {
+        var hidden = hiddenIn
         for layer in upsample {
             hidden = layer.step(hidden)
         }
