@@ -30,15 +30,34 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
 
     public var sampleRate: Int { config.sampleRate }
 
-    public var defaultGenerationParameters: GenerateParameters {
-        GenerateParameters(
-            maxTokens: 750,
-            temperature: 0.9,
-            topP: 1,
-            topK: 50,
-            repetitionPenalty: 1
-        )
+    public var defaultGenerationParameters: GenerateParameters { Self.defaultParameters }
+
+    /// Breeze's sampler defaults, static so a host app can start its own
+    /// controls from them without loading a model.
+    public static let defaultParameters = GenerateParameters(
+        maxTokens: 750,
+        temperature: 0.9,
+        topP: 1,
+        topK: 50,
+        repetitionPenalty: 1
+    )
+
+    /// The reference prefix ("[S0]<transcript>", the reference's codes, the
+    /// end-of-reference frame) for the last reference used. Encoding a
+    /// reference runs the Qwen3 speech-tokenizer encoder and the text encoder;
+    /// a guided take needs the prefix twice and a host splitting a long line
+    /// needs it once per piece, all for the same clip. Keyed by the reference
+    /// array's identity (the cache holds the array, so the identity can't be
+    /// reused) plus its transcript. A private struct behind a lock, the same
+    /// shape as Qwen3TTSModel's reference cache, so Module's parameter
+    /// reflection never mistakes the cached arrays for weights.
+    private struct ReferencePrefix {
+        let audio: MLXArray
+        let text: String
+        let prefix: MLXArray
     }
+    private let referencePrefixLock = NSLock()
+    private var referencePrefixCache: ReferencePrefix?
 
     init(config: BreezeTTSConfig) {
         self.config = config
@@ -162,15 +181,21 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             throw AudioGenerationError.invalidInput("maxTokens must be positive")
         }
 
+        // Whitespace is no instruction: promptText ignores it, so guiding
+        // toward it would only double the work per frame.
+        let directive = instruction.flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
+
         let started = Date()
         let conditionalPrompt = try promptEmbeddings(
             text: text,
-            instruction: instruction,
+            instruction: directive,
             refAudio: refAudio,
             refText: refText
         )
         let cfgScale = cfgScaleOverride ?? Self.defaultCFGScale
-        let usesGuidance = instruction?.isEmpty == false && cfgScale != 1
+        let usesGuidance = directive != nil && cfgScale != 1
         let unconditionalPrompt = usesGuidance
             ? try promptEmbeddings(text: text, instruction: nil, refAudio: refAudio, refText: refText)
             : nil
@@ -289,15 +314,32 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
         }
         var parts = [MLXArray]()
         if let refAudio, let refText {
-            parts.append(textEmbeddings(for: "[S0]\(refText)", tokenizer: tokenizer))
-            parts.append(try referenceAudioEmbeddings(refAudio))
-            let eos = MLXArray(
-                [Int32](repeating: Int32(config.codebookEOSTokenID), count: config.numCodebooks)
-            ).reshaped([1, 1, config.numCodebooks])
-            parts.append(backboneModel.embedTokens(eos))
+            parts.append(try referencePrefix(refAudio, refText: refText, tokenizer: tokenizer))
         }
         parts.append(textEmbeddings(for: Self.promptText(text: text, instruction: instruction), tokenizer: tokenizer))
         return concatenated(parts, axis: 1)
+    }
+
+    private func referencePrefix(
+        _ refAudio: MLXArray, refText: String, tokenizer: Tokenizers.Tokenizer
+    ) throws -> MLXArray {
+        if let cached = referencePrefixLock.withLock({ referencePrefixCache }),
+           cached.audio === refAudio, cached.text == refText {
+            return cached.prefix
+        }
+        let eos = MLXArray(
+            [Int32](repeating: Int32(config.codebookEOSTokenID), count: config.numCodebooks)
+        ).reshaped([1, 1, config.numCodebooks])
+        let prefix = concatenated([
+            textEmbeddings(for: "[S0]\(refText)", tokenizer: tokenizer),
+            try referenceAudioEmbeddings(refAudio),
+            backboneModel.embedTokens(eos),
+        ], axis: 1)
+        eval(prefix)
+        referencePrefixLock.withLock {
+            referencePrefixCache = ReferencePrefix(audio: refAudio, text: refText, prefix: prefix)
+        }
+        return prefix
     }
 
     private func textEmbeddings(for text: String, tokenizer: Tokenizers.Tokenizer) -> MLXArray {
