@@ -1929,6 +1929,17 @@ struct BreezeTTSTests {
         #expect(BreezeTTSModel.defaultParameters.topK == 50)
     }
 
+    @Test func samplerDefaultsMatchUpstreamInference() {
+        // breeze-tts infer.py / api.py: temperature 0.9, top-k 50, top-p 1,
+        // and a 1.1 repetition penalty on codebook 0. Without the penalty a
+        // take can loop on one silent frame and leave 10 s+ of dead air.
+        let p = BreezeTTSModel.defaultParameters
+        #expect(p.temperature == 0.9)
+        #expect(p.topK == 50)
+        #expect(p.topP == 1)
+        #expect(p.repetitionPenalty == 1.1)
+    }
+
     @Test func sanitizeSeparatesMainModelFromCodecWeights() {
         let depth = MLXArray.ones([2, 2])
         let stale = MLXArray.zeros([2, 2])

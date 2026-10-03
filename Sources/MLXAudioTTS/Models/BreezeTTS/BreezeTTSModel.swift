@@ -33,13 +33,17 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
     public var defaultGenerationParameters: GenerateParameters { Self.defaultParameters }
 
     /// Breeze's sampler defaults, static so a host app can start its own
-    /// controls from them without loading a model.
+    /// controls from them without loading a model. They match upstream's
+    /// inference (breeze-tts infer.py / api.py), including its 1.1
+    /// repetition penalty on codebook 0: at 1.0 a take can fall into
+    /// repeating one silent frame and leave seconds of dead air, typically
+    /// at a vocal-event tag such as "(clears throat)".
     public static let defaultParameters = GenerateParameters(
         maxTokens: 750,
         temperature: 0.9,
         topP: 1,
         topK: 50,
-        repetitionPenalty: 1
+        repetitionPenalty: 1.1
     )
 
     /// The reference prefix ("[S0]<transcript>", the reference's codes, the
