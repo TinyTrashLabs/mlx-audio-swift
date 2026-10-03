@@ -18,6 +18,16 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
     var tokenizer: Tokenizers.Tokenizer?
     var audioTokenizer: Qwen3TTSSpeechTokenizer?
 
+    /// Classifier-free guidance scale for instructed generation (voice design
+    /// and directed cloning). nil = 4, the value upstream's examples use and
+    /// this port used to hard-code. 1 disables guidance (and its second,
+    /// unconditional pass). Only consulted when an instruction is present —
+    /// a plain clone has nothing to guide toward. Same per-call override
+    /// pattern as ChatterboxModel.cfgWeightOverride, since
+    /// `SpeechGenerationModel.generate` has no guidance argument.
+    public var cfgScaleOverride: Float?
+    public static let defaultCFGScale: Float = 4
+
     public var sampleRate: Int { config.sampleRate }
 
     public var defaultGenerationParameters: GenerateParameters {
@@ -159,7 +169,8 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             refAudio: refAudio,
             refText: refText
         )
-        let usesGuidance = instruction?.isEmpty == false
+        let cfgScale = cfgScaleOverride ?? Self.defaultCFGScale
+        let usesGuidance = instruction?.isEmpty == false && cfgScale != 1
         let unconditionalPrompt = usesGuidance
             ? try promptEmbeddings(text: text, instruction: nil, refAudio: refAudio, refText: refText)
             : nil
@@ -193,7 +204,7 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             var logits = lmHead(conditionalHidden)
             if let unconditionalHidden {
                 let unconditioned = lmHead(unconditionalHidden)
-                logits = unconditioned + 4 * (logits - unconditioned)
+                logits = unconditioned + cfgScale * (logits - unconditioned)
             }
             logits = applyRepetitionPenalty(
                 logits,
@@ -218,7 +229,7 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
                         tokenIDs: ids,
                         backboneHiddenState: unconditionalHidden
                     )
-                    depthLogits = unconditioned + 4 * (depthLogits - unconditioned)
+                    depthLogits = unconditioned + cfgScale * (depthLogits - unconditioned)
                 }
                 depthLogits = maskReservedTokens(depthLogits, allowsEOS: false)
                 let next = sample(depthLogits, sampler: sampler)

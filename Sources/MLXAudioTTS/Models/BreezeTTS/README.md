@@ -45,6 +45,12 @@ let cloned = try await model.generate(
 
 You can also set `voice` while cloning to direct the cloned voice. The model uses classifier-free guidance for voice design and directed cloning.
 
+Guidance strength defaults to 4. Set `cfgScaleOverride` on the loaded `BreezeTTSModel` to change it (1 turns guidance off and skips the unconditional pass):
+
+```swift
+(model as? BreezeTTSModel)?.cfgScaleOverride = 6
+```
+
 ## Output and streaming
 
 Breeze returns mono audio at 24 kHz. `generateStream` reports token and timing events while it generates, then yields the decoded waveform as one audio event. The public API can add codec chunk streaming later without changing model loading or prompt controls.
