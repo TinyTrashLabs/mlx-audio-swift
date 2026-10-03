@@ -80,6 +80,21 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
         )
     }
 
+    /// The instruction as the prompt will use it: nil when absent or blank.
+    /// Whitespace is no instruction — promptText ignores it — so it must not
+    /// switch on guidance, which would only double the work per frame.
+    static func directive(_ instruction: String?) -> String? {
+        instruction.flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
+    }
+
+    /// Guidance runs only with an instruction to guide toward, and never at a
+    /// scale of 1 (the Python reference's `cfg_scale not in (None, 1.0)`).
+    static func usesGuidance(directive: String?, cfgScale: Float) -> Bool {
+        directive != nil && cfgScale != 1
+    }
+
     static func promptText(text: String, instruction: String?) -> String {
         guard let instruction, !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return "[S0]\(text)"
@@ -181,11 +196,7 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             throw AudioGenerationError.invalidInput("maxTokens must be positive")
         }
 
-        // Whitespace is no instruction: promptText ignores it, so guiding
-        // toward it would only double the work per frame.
-        let directive = instruction.flatMap {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
-        }
+        let directive = Self.directive(instruction)
 
         let started = Date()
         let conditionalPrompt = try promptEmbeddings(
@@ -194,8 +205,9 @@ public final class BreezeTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             refAudio: refAudio,
             refText: refText
         )
+        let usesGuidance = Self.usesGuidance(
+            directive: directive, cfgScale: cfgScaleOverride ?? Self.defaultCFGScale)
         let cfgScale = cfgScaleOverride ?? Self.defaultCFGScale
-        let usesGuidance = directive != nil && cfgScale != 1
         let unconditionalPrompt = usesGuidance
             ? try promptEmbeddings(text: text, instruction: nil, refAudio: refAudio, refText: refText)
             : nil

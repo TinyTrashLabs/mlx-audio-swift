@@ -1918,6 +1918,17 @@ struct BreezeTTSTests {
         )
     }
 
+    @Test func blankInstructionIsNoInstructionAndNeverTurnsOnGuidance() {
+        #expect(BreezeTTSModel.directive(nil) == nil)
+        #expect(BreezeTTSModel.directive("   \n") == nil)
+        #expect(BreezeTTSModel.directive(" Warm ") == " Warm ")
+        #expect(!BreezeTTSModel.usesGuidance(directive: BreezeTTSModel.directive("  "), cfgScale: 4))
+        #expect(BreezeTTSModel.usesGuidance(directive: "Warm", cfgScale: 4))
+        #expect(!BreezeTTSModel.usesGuidance(directive: "Warm", cfgScale: 1))
+        #expect(BreezeTTSModel.defaultCFGScale == 4)
+        #expect(BreezeTTSModel.defaultParameters.topK == 50)
+    }
+
     @Test func sanitizeSeparatesMainModelFromCodecWeights() {
         let depth = MLXArray.ones([2, 2])
         let stale = MLXArray.zeros([2, 2])
