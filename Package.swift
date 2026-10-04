@@ -120,6 +120,7 @@ let package = Package(
             ],
             path: "Sources/MLXAudioTTS",
             exclude: [
+                "Models/BreezeTTS/README.md",
                 "Models/Chatterbox/README.md",
                 "Models/EchoTTS/README.md",
                 "Models/FishSpeech/README.md",
