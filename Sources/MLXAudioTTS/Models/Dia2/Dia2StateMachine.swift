@@ -70,6 +70,30 @@ public final class Dia2State {
         endStep = nil
     }
 
+    /// Consumes any prefix entries warm-up left queued.
+    ///
+    /// Warm-up forces one new-word per scheduled frame, but `enforce` pads a
+    /// forced new-word away while an earlier word's tokens are still pending,
+    /// and two words can round onto the same frame. Either way the head lags,
+    /// and whatever is still queued when free generation starts is spoken as
+    /// the opening of the generated turn — the reference clip's own last
+    /// words. The lag grows with the prefix, so longer reference audio leaks
+    /// more of itself.
+    ///
+    /// Draining keeps the drained words in `transcript`, because they are
+    /// still prefix: their timings belong to conditioning, not to output.
+    func drainPrefix(through count: Int, at step: Int) {
+        while head < count {
+            let entry = entries[head]
+            head += 1
+            if !entry.tokens.isEmpty { note(entry.text, at: step) }
+            noteConsumption(step)
+        }
+        pendingTokens.removeAll(); pendingHead = 0
+        lookaheadTokens.removeAll(); lookaheadHead = 0
+        forcedPadding = 0
+    }
+
     func recordEnd(_ step: Int) { if endStep == nil { endStep = step } }
     func note(_ text: String, at step: Int) { transcript.append((text, step)) }
     func noteConsumption(_ step: Int) { consumptionTimes.append(step) }
