@@ -353,8 +353,10 @@ final class QwenPrefillProbe: XCTestCase {
         dec.resetStreamingState()
     }
 
-    /// Is a prefill split at a shared prefix bit-identical to one forward?
-    func testSplitPrefillExperiment() async throws {
+    /// A prefill split at a shared prefix (the talker's offset-aware mask) is
+    /// bit-identical to one forward: last hidden row, logits and every KV row.
+    /// (The codec head on the last row alone is not: M=1 takes another kernel.)
+    func testSplitPrefillMatchesOneForward() async throws {
         let (model, fresh, carried) = try await conditionings()
         let talker = model.talker
         for (name, c) in [("fresh", fresh), ("carried", carried)] {
@@ -366,11 +368,7 @@ final class QwenPrefillProbe: XCTestCase {
             for prefix in [67, 64, 128] {
                 let cache = talker.makeCache()
                 let (_, _) = talker(embeds[0..., ..<prefix, 0...], cache: cache)
-                let n = rows - prefix
-                let q = MLXArray(Int32(prefix) ..< Int32(rows)).reshaped(n, 1)
-                let k = MLXArray(Int32(0) ..< Int32(rows)).reshaped(1, rows)
-                let mask = ((k .> q).asType(.float32) * Float(-1e9)).asType(embeds.dtype)
-                let (logits, hidden) = talker(embeds[0..., prefix..., 0...], mask: mask, cache: cache)
+                let (logits, hidden) = talker(embeds[0..., prefix..., 0...], cache: cache)
                 eval(logits, hidden)
                 let hl = arrayEqual(hidden[0..., (-1)..., 0...], fullHidden[0..., (-1)..., 0...]).item(Bool.self)
                 let ll = arrayEqual(logits[0..., (-1)..., 0...], fullLogits[0..., (-1)..., 0...]).item(Bool.self)
@@ -378,7 +376,8 @@ final class QwenPrefillProbe: XCTestCase {
                 let kvSame = zip(cache, fullCache).allSatisfy { a, b in
                     zip(a.state, b.state).allSatisfy { arrayEqual($0, $1).item(Bool.self) } }
                 print("[prefill-probe] split \(name) rows \(rows) at \(prefix): last hidden same \(hl) (max \(d)), "
-                      + "logits same \(ll), kv same \(kvSame), dtype \(embeds.dtype) mask \(MultiHeadAttention.createAdditiveCausalMask(3).asType(embeds.dtype))")
+                      + "logits same \(ll), kv same \(kvSame)")
+                XCTAssertTrue(hl && ll && kvSame, "\(name) split at \(prefix)")
             }
             // Codec head on the last row only.
             let lastOnly = talker.codecHead(fullHidden[0..., (-1)..., 0...])

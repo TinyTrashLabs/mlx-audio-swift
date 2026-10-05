@@ -24,14 +24,12 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     private let inputPreparationCacheLock = NSLock()
     private var cachedReferenceAudioContext: ReferenceAudioContext?
-    /// The streaming decoder's state after priming on `codes` (`fastPrefill`):
-    /// a line that starts from the same reference restores it instead of
-    /// priming again. Held strongly, so the identity check cannot alias.
     /// The talker's keys/values for the last ICL prompt's head and transcript
     /// rows (`fastPrefill`). Every part of a read starts with the same role,
     /// codec prefix and reference transcript, so the next prompt reuses the
     /// longest common prefix instead of prefilling it again.
     private struct PromptPrefixKV {
+        let roleIDs: [Int32]
         let textIDs: [Int32]
         let codecLanguageID: Int?
         let speakerEmbedding: MLXArray?
@@ -39,6 +37,9 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let kv: [[MLXArray]]
     }
     private var cachedPromptPrefix: PromptPrefixKV?
+    /// The streaming decoder's state after priming on `codes` (`fastPrefill`):
+    /// a line that starts from the same reference restores it instead of
+    /// priming again. Held strongly, so the identity check cannot alias.
     private var cachedPrimedDecoder: (codes: MLXArray, state: Qwen3TTSSpeechTokenizerDecoder.StreamingState)?
 
     public var sampleRate: Int { config.sampleRate }
@@ -125,20 +126,25 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// the "hiss to the token cap" failure the phone produced at 25.44 s.
     public nonisolated(unsafe) static var trailingSilenceStopSeconds: Double = 0
     public nonisolated(unsafe) static var trailingSilenceFloorDb: Float = -35
+    /// Fast part start (2026-10-05). On:
+    /// - the talker reuses the keys/values of the prompt rows this line
+    ///   shares with the last one (role, codec prefix, reference transcript)
+    ///   and prefills only the rest -- bit-identical to one forward;
+    /// - the streaming decoder primes through a trimmed vocoder tail (only the
+    ///   samples that reach the state it keeps), restores a cached primed
+    ///   state when the line starts from the reference's own codes, and is
+    ///   primed after frame 0 rather than before the prefill (the first chunk
+    ///   is the first thing that needs it).
+    /// Seeded codes are unchanged; the trimmed tail's audio differs from the
+    /// full tail's by float rounding only (below -70 dBFS). `QwenPrefillProbe`
+    /// has the parity checks and the timings. Off: the pre-2026-10-05 path,
+    /// for an A/B on a device.
+    public nonisolated(unsafe) static var fastPrefill = true
     /// Part-start profiling (prefill probe, 2026-10-05). When on, the start
     /// of a render evals at each stage boundary -- prompt build, decoder
     /// priming (run inline, not on the decode queue), talker prefill, frame 0
     /// -- and records each stage's wall seconds in `lastStartProfile`, in
     /// order. Serialises what the app overlaps, so diagnostics only.
-    /// Fast part start (2026-10-05). On: the streaming decoder primes on the
-    /// reference through a trimmed tail (only the samples that reach its
-    /// kept state), restores a cached primed state when the line starts from
-    /// the same reference codes as the last one, and is primed after frame 0
-    /// instead of before the prefill (it is first needed by the first chunk).
-    /// Codes are unchanged (the decoder never feeds the talker); see
-    /// `QwenPrefillProbe` for the state parity and the timings. Off: the
-    /// pre-2026-10-05 path, for an A/B on a device.
-    public nonisolated(unsafe) static var fastPrefill = true
     public nonisolated(unsafe) static var profileStart = false
     public nonisolated(unsafe) static var lastStartProfile: [(stage: String, seconds: Double)] = []
     private static func profileAdd(_ key: String, _ seconds: Double) {
@@ -614,8 +620,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         if Self.fastPrefill, let c = iclConditioning {
             let textIDs = c.referenceTextTokenIDs.asArray(Int32.self)
             let headRows = Self.iclHeadRows(c)
+            // The role rows are the line's first 3 tokens (as in prepareICLGenerationInputs).
+            let roleIDs = tokenizer.encode(text: "<|im_start|>assistant\n\(text)<|im_end|>\n<|im_start|>assistant\n")
+                .prefix(3).map { Int32($0) }
             if let cached = withInputPreparationCacheLock({ cachedPromptPrefix }),
-               cached.headRows == headRows, cached.codecLanguageID == c.codecLanguageID,
+               cached.roleIDs == roleIDs, cached.headRows == headRows, cached.codecLanguageID == c.codecLanguageID,
                cached.speakerEmbedding === c.speakerEmbedding {
                 var common = 0
                 while common < min(cached.textIDs.count, textIDs.count),
@@ -630,7 +639,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 }
             }
             prefixStoreRows = headRows + textIDs.count
-            prefixToStore = PromptPrefixKV(textIDs: textIDs, codecLanguageID: c.codecLanguageID,
+            prefixToStore = PromptPrefixKV(roleIDs: roleIDs, textIDs: textIDs, codecLanguageID: c.codecLanguageID,
                                            speakerEmbedding: c.speakerEmbedding, headRows: headRows, kv: [])
         }
         let eosTokenArray = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
@@ -715,7 +724,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     layer.state.map { contiguous($0[.ellipsis, ..<prefixStoreRows, 0...]) }
                 }
                 asyncEval(kv.flatMap { $0 })
-                let stored = PromptPrefixKV(textIDs: p.textIDs, codecLanguageID: p.codecLanguageID,
+                let stored = PromptPrefixKV(roleIDs: p.roleIDs, textIDs: p.textIDs, codecLanguageID: p.codecLanguageID,
                                             speakerEmbedding: p.speakerEmbedding, headRows: p.headRows, kv: kv)
                 withInputPreparationCacheLock { cachedPromptPrefix = stored }
                 prefixToStore = nil
