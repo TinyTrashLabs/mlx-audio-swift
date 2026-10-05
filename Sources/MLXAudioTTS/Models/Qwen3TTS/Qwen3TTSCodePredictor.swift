@@ -221,6 +221,11 @@ final class Qwen3TTSCodePredictor: Module {
 
     var codecEmbedding: [Embedding] { model.codecEmbedding }
 
+    /// `fusedFrame()`'s once-per-model result (nil when the weights are not
+    /// fusable); resolved on first use, after the weights are loaded.
+    var fusedFrameCache: Qwen3TTSFusedCodePredictor?
+    var fusedFrameResolved = false
+
     init(config: Qwen3TTSTalkerCodePredictorConfig, talkerHiddenSize: Int) {
         self.config = config
         self.numCodeGroups = config.numCodeGroups
