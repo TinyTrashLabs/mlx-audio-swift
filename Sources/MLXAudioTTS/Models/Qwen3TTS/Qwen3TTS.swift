@@ -78,6 +78,18 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     public nonisolated(unsafe) static var lastFrameCount = 0
     public nonisolated(unsafe) static var lastTextExhaustedFrame: Int?
     public nonisolated(unsafe) static var lastEffectiveMaxTokens = 0
+    /// The codec frames the most recent generation kept (EOS excluded), as
+    /// `[1, numCodeGroups, frames]` int32 -- the layout of
+    /// `Qwen3TTSReferenceConditioning.referenceSpeechCodes`, so a take can be
+    /// handed straight to `continuing(_:previousText:previousCodes:)`. Nil
+    /// until a generation finishes (a cancelled one leaves it nil).
+    public nonisolated(unsafe) static var lastGeneratedCodes: MLXArray?
+    /// Frames a render may generate per token of its text (upstream: 6, with
+    /// a floor of 75). The cap stops a take that never says EOS, but it also
+    /// cuts a slow or pause-rich read short: a 44-token line stops at exactly
+    /// 264 frames (21.12 s). A host that reads slowly can raise it; the
+    /// trailing-silence and greedy-EOS stops bound the runaway case anyway.
+    public nonisolated(unsafe) static var framesPerTextToken = 6
     /// Optional per-frame probe: (frame, log P(EOS) under the talker's raw
     /// logits, sampled first-codebook token). Forces an extra eval per frame,
     /// so leave it nil outside diagnostics.
@@ -511,8 +523,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
 
         // Cap max tokens based on text length
-        let targetTokenCount = tokenizer.encode(text: text).count
-        let effectiveMaxTokens = min(maxTokens, max(75, targetTokenCount * 6))
+        let effectiveMaxTokens = frameBudget(text: text, maxTokens: maxTokens, tokenizer: tokenizer)
 
         // Initialize cache and timing
         let startTime = Date()
@@ -590,6 +601,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         Self.lastFrameCount = 0
         Self.lastTextExhaustedFrame = trailingTextHidden.dim(1) == 0 ? 0 : nil
         Self.lastEffectiveMaxTokens = effectiveMaxTokens
+        Self.lastGeneratedCodes = nil
         for step in 0 ..< effectiveMaxTokens {
             try Task.checkCancellation()
             var stageStart = Date()
@@ -749,6 +761,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         try Task.checkCancellation()
         if Self.lastStopReason == nil { Self.lastStopReason = .maxTokens }
         Self.lastFrameCount = generatedCodes.count
+        if !generatedCodes.isEmpty {
+            let kept = stacked(generatedCodes, axis: 1).transposed(0, 2, 1).asType(.int32) // [1, groups, frames]
+            eval(kept)
+            Self.lastGeneratedCodes = kept
+        }
 
         guard !generatedCodes.isEmpty else {
             return MLXArray.zeros([1])
@@ -822,6 +839,81 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             speakerEmbedding: nil,
             language: language ?? "auto"
         )
+    }
+
+    // MARK: - Continuation (one read, many parts)
+
+    /// The conditioning for the next part of a read: `base` (the voice
+    /// reference) followed by the part before it, the way Qwen continues its
+    /// own reference. The ICL prompt becomes `[ref text ; previous text ; line
+    /// ; tts_eos]` then `[codec_bos ; ref codes ; previous codes]`, and a
+    /// streaming render primes the decoder on `[ref codes ; previous codes]`
+    /// (their audio is dropped), so pace, level and pitch carry across the
+    /// join instead of restarting from the reference.
+    ///
+    /// - Parameters:
+    ///   - previousText: the transcript of the previous part, as rendered.
+    ///   - previousCodes: its codec frames, `[1, numCodeGroups, frames]`
+    ///     (`lastGeneratedCodes`, optionally trimmed to the end of speech).
+    public func continuing(
+        _ base: Qwen3TTSReferenceConditioning,
+        previousText: String,
+        previousCodes: MLXArray
+    ) throws -> Qwen3TTSReferenceConditioning {
+        guard let tokenizer else {
+            throw AudioGenerationError.modelNotInitialized("Qwen3TTS continuation requires the text tokenizer.")
+        }
+        let refCodes = base.referenceSpeechCodes
+        guard previousCodes.ndim == 3, previousCodes.dim(0) == refCodes.dim(0),
+              previousCodes.dim(1) == refCodes.dim(1) else {
+            throw AudioGenerationError.invalidInput(
+                "previousCodes must be [\(refCodes.dim(0)), \(refCodes.dim(1)), frames], got \(previousCodes.shape)")
+        }
+        let prevIds = transcriptTokenIDs(previousText, tokenizer: tokenizer)
+        return Qwen3TTSReferenceConditioning(
+            speakerEmbedding: base.speakerEmbedding,
+            referenceSpeechCodes: concatenated([refCodes, previousCodes.asType(refCodes.dtype)], axis: 2),
+            referenceTextTokenIDs: concatenated([base.referenceTextTokenIDs, prevIds], axis: 1),
+            resolvedLanguage: base.resolvedLanguage,
+            codecLanguageID: base.codecLanguageID
+        )
+    }
+
+    /// Rows the talker prefills for `text` under `conditioning` (ICL path):
+    /// role + codec prefix + `[ref text ; line ; tts_eos]` + `[codec_bos ;
+    /// ref codes]`. Each row costs one KV slot per layer for the whole render.
+    public func promptRows(text: String, conditioning: Qwen3TTSReferenceConditioning) -> Int {
+        guard let tokenizer else { return 0 }
+        let lineTokens = tokenizer.encode(
+            text: "<|im_start|>assistant\n\(text)<|im_end|>\n<|im_start|>assistant\n").count
+        let line = max(0, lineTokens - 3 - 5)
+        let prefix = 3 + (conditioning.codecLanguageID == nil ? 3 : 4)
+            + (conditioning.speakerEmbedding == nil ? 0 : 1) + 2 - 1
+        return prefix + conditioning.referenceTextTokenIDs.dim(1) + line + 1
+            + 1 + conditioning.referenceSpeechCodes.dim(2)
+    }
+
+    /// The most frames a render of `text` may generate: `maxTokens`, capped
+    /// by the text's length (`framesPerTextToken` frames a token, at least 75).
+    /// The context (reference, a carried previous part) does not change it.
+    public func frameBudget(text: String, maxTokens: Int) -> Int {
+        guard let tokenizer else { return maxTokens }
+        return frameBudget(text: text, maxTokens: maxTokens, tokenizer: tokenizer)
+    }
+
+    private func frameBudget(text: String, maxTokens: Int, tokenizer: Tokenizers.Tokenizer) -> Int {
+        min(maxTokens, max(75, tokenizer.encode(text: text).count * Self.framesPerTextToken))
+    }
+
+    /// A transcript's token ids as the ICL prompt holds them: the text alone,
+    /// without the chat wrapper, `[1, n]`.
+    private func transcriptTokenIDs(_ text: String, tokenizer: Tokenizers.Tokenizer) -> MLXArray {
+        let ids = MLXArray(tokenizer.encode(text: "<|im_start|>assistant\n\(text)<|im_end|>\n").map { Int32($0) })
+            .reshaped(1, -1)
+        let count = ids.dim(1)
+        let start = min(3, count)
+        let end = max(start, count - 2)
+        return ids[0..., start ..< end]
     }
 
     private struct VoiceDesignGenerationSettings {
@@ -945,12 +1037,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let resolvedLanguage = language.lowercased() == "auto" ? "auto" : language.lowercased()
 
         // Reference text tokenization
-        let refChatText = "<|im_start|>assistant\n\(refText)<|im_end|>\n"
-        let refIds = MLXArray(tokenizer.encode(text: refChatText).map { Int32($0) }).reshaped(1, -1)
-        let refCount = refIds.dim(1)
-        let refStart = min(3, refCount)
-        let refEnd = max(refStart, refCount - 2)
-        let refTextIds = refIds[0..., refStart ..< refEnd]
+        let refTextIds = transcriptTokenIDs(refText, tokenizer: tokenizer)
 
         // Language ID
         var languageId: Int?
