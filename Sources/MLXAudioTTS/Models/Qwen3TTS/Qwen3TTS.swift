@@ -24,6 +24,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     private let inputPreparationCacheLock = NSLock()
     private var cachedReferenceAudioContext: ReferenceAudioContext?
+    /// The streaming decoder's state after priming on `codes` (`fastPrefill`):
+    /// a line that starts from the same reference restores it instead of
+    /// priming again. Held strongly, so the identity check cannot alias.
+    private var cachedPrimedDecoder: (codes: MLXArray, state: Qwen3TTSSpeechTokenizerDecoder.StreamingState)?
 
     public var sampleRate: Int { config.sampleRate }
 
@@ -109,6 +113,22 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// the "hiss to the token cap" failure the phone produced at 25.44 s.
     public nonisolated(unsafe) static var trailingSilenceStopSeconds: Double = 0
     public nonisolated(unsafe) static var trailingSilenceFloorDb: Float = -35
+    /// Part-start profiling (prefill probe, 2026-10-05). When on, the start
+    /// of a render evals at each stage boundary -- prompt build, decoder
+    /// priming (run inline, not on the decode queue), talker prefill, frame 0
+    /// -- and records each stage's wall seconds in `lastStartProfile`, in
+    /// order. Serialises what the app overlaps, so diagnostics only.
+    /// Fast part start (2026-10-05). On: the streaming decoder primes on the
+    /// reference through a trimmed tail (only the samples that reach its
+    /// kept state), restores a cached primed state when the line starts from
+    /// the same reference codes as the last one, and is primed after frame 0
+    /// instead of before the prefill (it is first needed by the first chunk).
+    /// Codes are unchanged (the decoder never feeds the talker); see
+    /// `QwenPrefillProbe` for the state parity and the timings. Off: the
+    /// pre-2026-10-05 path, for an A/B on a device.
+    public nonisolated(unsafe) static var fastPrefill = true
+    public nonisolated(unsafe) static var profileStart = false
+    public nonisolated(unsafe) static var lastStartProfile: [(stage: String, seconds: Double)] = []
     private static func profileAdd(_ key: String, _ seconds: Double) {
         loopProfile[key, default: 0] += seconds
     }
@@ -435,6 +455,21 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
     }
 
+    /// Primes `decoder` (already reset) on `codes`, or restores the state a
+    /// previous prime on the same codes left (`fastPrefill`).
+    private func primeDecoder(_ decoder: Qwen3TTSSpeechTokenizerDecoder, on codes: MLXArray) {
+        if let cached = withInputPreparationCacheLock({ cachedPrimedDecoder }), cached.codes === codes {
+            decoder.restoreStreamingState(cached.state)
+            return
+        }
+        decoder.primeStreaming(codes, trimmed: true)
+        // Only a reference's own codes come back (a carried part's are new
+        // every part), so only those are kept.
+        guard withInputPreparationCacheLock({ cachedReferenceAudioContext?.refCodes === codes }) else { return }
+        let state = decoder.streamingState()
+        withInputPreparationCacheLock { cachedPrimedDecoder = (codes, state) }
+    }
+
     // MARK: - VoiceDesign generation
 
     func generateVoiceDesign(
@@ -463,6 +498,15 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
 
         let talkerConfig = config.talkerConfig!
+
+        let profilingStart = Self.profileStart
+        var startMark = Date()
+        if profilingStart { Self.lastStartProfile = [] }
+        func markStart(_ stage: String) {
+            let now = Date()
+            Self.lastStartProfile.append((stage, now.timeIntervalSince(startMark)))
+            startMark = now
+        }
 
         // Prepare inputs
         let inputEmbedsInit: MLXArray
@@ -522,6 +566,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             refCodes = nil
         }
 
+        if profilingStart { eval(inputEmbedsInit, trailingTextHidden, ttsPadEmbed); markStart("prompt") }
+
         // Cap max tokens based on text length
         let effectiveMaxTokens = frameBudget(text: text, maxTokens: maxTokens, tokenizer: tokenizer)
 
@@ -571,6 +617,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             }
         }
 
+        // Decoder priming, dispatched once: before the prefill (upstream) or,
+        // with `fastPrefill`, after frame 0 -- the first chunk is the first
+        // thing that needs it, so frame 0 no longer waits on it.
+        let fastPrefill = Self.fastPrefill
+        var pendingPrime: (() -> Void)?
+        func dispatchPrime() {
+            if let p = pendingPrime { pendingPrime = nil; p() }
+        }
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
             // ICL: run the reference codes through the streaming decoder first and drop their
@@ -579,14 +633,23 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             // Benson's first word came out an octave high (185-245 Hz vs 101-106 Hz), heard as a
             // voice crack. On the async path this overlaps prefill and the first chunk.
             if let refCodes {
-                let prime = { speechTokenizer.decoder.primeStreaming(refCodes) }
-                if Self.asyncDecode > 0 {
-                    decodeQueue.async {
-                        if Self.asyncDecode == 2 { Stream.withNewDefaultStream(device: Device(.gpu), prime) } else { prime() }
+                let prime: () -> Void = fastPrefill
+                    ? { [weak self] in self?.primeDecoder(speechTokenizer.decoder, on: refCodes) }
+                    : { speechTokenizer.decoder.primeStreaming(refCodes) }
+                pendingPrime = {
+                    if profilingStart {
+                        prime()
+                        markStart("prime")
+                    } else if Self.asyncDecode > 0 {
+                        decodeQueue.async {
+                            if Self.asyncDecode == 2 { Stream.withNewDefaultStream(device: Device(.gpu), prime) } else { prime() }
+                        }
+                    } else {
+                        prime()
                     }
-                } else {
-                    prime()
                 }
+                // The upstream order: primed before the prefill is built.
+                if !fastPrefill { dispatchPrime() }
             }
         }
         defer {
@@ -608,6 +671,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
             if Self.pipelineFrame { asyncEval(logits, hidden) }
+            if profilingStart, step == 0 { eval(logits, hidden); markStart("prefill") }
             if profiling { eval(logits, hidden); Self.profileAdd("talker", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Sample first codebook token
@@ -710,6 +774,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
             inputEmbeds = textEmbed + codecEmbed
             eval(inputEmbeds, isEOS)
+            if profilingStart, step == 0 { markStart("frame0") }
             if profiling { Self.profileAdd("nextInput", Date().timeIntervalSince(stageStart)); stageStart = Date(); Self.loopProfileFrames += 1 }
 
             let tokenId = Int(nextToken[0, 0].item(Int32.self))
@@ -718,6 +783,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 probe(step, logProbs[0, eosTokenId].item(Float.self), tokenId)
             }
             onToken?(tokenId)
+            dispatchPrime()
             if isEOS.item(Bool.self) {
                 Self.lastStopReason = .eos
                 break
