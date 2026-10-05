@@ -24,6 +24,23 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     private let inputPreparationCacheLock = NSLock()
     private var cachedReferenceAudioContext: ReferenceAudioContext?
+    /// The talker's keys/values for the last ICL prompt's head and transcript
+    /// rows (`fastPrefill`). Every part of a read starts with the same role,
+    /// codec prefix and reference transcript, so the next prompt reuses the
+    /// longest common prefix instead of prefilling it again.
+    private struct PromptPrefixKV {
+        let roleIDs: [Int32]
+        let textIDs: [Int32]
+        let codecLanguageID: Int?
+        let speakerEmbedding: MLXArray?
+        let headRows: Int
+        let kv: [[MLXArray]]
+    }
+    private var cachedPromptPrefix: PromptPrefixKV?
+    /// The streaming decoder's state after priming on `codes` (`fastPrefill`):
+    /// a line that starts from the same reference restores it instead of
+    /// priming again. Held strongly, so the identity check cannot alias.
+    private var cachedPrimedDecoder: (codes: MLXArray, state: Qwen3TTSSpeechTokenizerDecoder.StreamingState)?
 
     public var sampleRate: Int { config.sampleRate }
 
@@ -109,6 +126,27 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// the "hiss to the token cap" failure the phone produced at 25.44 s.
     public nonisolated(unsafe) static var trailingSilenceStopSeconds: Double = 0
     public nonisolated(unsafe) static var trailingSilenceFloorDb: Float = -35
+    /// Fast part start (2026-10-05). On:
+    /// - the talker reuses the keys/values of the prompt rows this line
+    ///   shares with the last one (role, codec prefix, reference transcript)
+    ///   and prefills only the rest -- bit-identical to one forward;
+    /// - the streaming decoder primes through a trimmed vocoder tail (only the
+    ///   samples that reach the state it keeps), restores a cached primed
+    ///   state when the line starts from the reference's own codes, and is
+    ///   primed after frame 0 rather than before the prefill (the first chunk
+    ///   is the first thing that needs it).
+    /// Seeded codes are unchanged; the trimmed tail's audio differs from the
+    /// full tail's by float rounding only (below -70 dBFS). `QwenPrefillProbe`
+    /// has the parity checks and the timings. Off: the pre-2026-10-05 path,
+    /// for an A/B on a device.
+    public nonisolated(unsafe) static var fastPrefill = true
+    /// Part-start profiling (prefill probe, 2026-10-05). When on, the start
+    /// of a render evals at each stage boundary -- prompt build, decoder
+    /// priming (run inline, not on the decode queue), talker prefill, frame 0
+    /// -- and records each stage's wall seconds in `lastStartProfile`, in
+    /// order. Serialises what the app overlaps, so diagnostics only.
+    public nonisolated(unsafe) static var profileStart = false
+    public nonisolated(unsafe) static var lastStartProfile: [(stage: String, seconds: Double)] = []
     private static func profileAdd(_ key: String, _ seconds: Double) {
         loopProfile[key, default: 0] += seconds
     }
@@ -435,6 +473,21 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
     }
 
+    /// Primes `decoder` (already reset) on `codes`, or restores the state a
+    /// previous prime on the same codes left (`fastPrefill`).
+    private func primeDecoder(_ decoder: Qwen3TTSSpeechTokenizerDecoder, on codes: MLXArray) {
+        if let cached = withInputPreparationCacheLock({ cachedPrimedDecoder }), cached.codes === codes {
+            decoder.restoreStreamingState(cached.state)
+            return
+        }
+        decoder.primeStreaming(codes, trimmed: true)
+        // Only a reference's own codes come back (a carried part's are new
+        // every part), so only those are kept.
+        guard withInputPreparationCacheLock({ cachedReferenceAudioContext?.refCodes === codes }) else { return }
+        let state = decoder.streamingState()
+        withInputPreparationCacheLock { cachedPrimedDecoder = (codes, state) }
+    }
+
     // MARK: - VoiceDesign generation
 
     func generateVoiceDesign(
@@ -464,13 +517,24 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         let talkerConfig = config.talkerConfig!
 
+        let profilingStart = Self.profileStart
+        var startMark = Date()
+        if profilingStart { Self.lastStartProfile = [] }
+        func markStart(_ stage: String) {
+            let now = Date()
+            Self.lastStartProfile.append((stage, now.timeIntervalSince(startMark)))
+            startMark = now
+        }
+
         // Prepare inputs
         let inputEmbedsInit: MLXArray
         let trailingTextHidden: MLXArray
         let ttsPadEmbed: MLXArray
         let refCodes: MLXArray?
+        var iclConditioning: Qwen3TTSReferenceConditioning?
 
         if let conditioning {
+            iclConditioning = conditioning
             let prepared = try prepareICLGenerationInputs(
                 text: text,
                 conditioning: conditioning
@@ -482,12 +546,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         } else if let refAudio,
            let refText,
            speechTokenizer.hasEncoder {
-            let prepared = try prepareICLGenerationInputs(
-                text: text,
-                refAudio: refAudio,
-                refText: refText,
-                language: language
-            )
+            let refConditioning = try prepareReferenceConditioning(
+                refAudio: refAudio, refText: refText, speakerEmbedding: nil, language: language)
+            iclConditioning = refConditioning
+            let prepared = try prepareICLGenerationInputs(text: text, conditioning: refConditioning)
             inputEmbedsInit = prepared.0
             trailingTextHidden = prepared.1
             ttsPadEmbed = prepared.2
@@ -522,6 +584,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             refCodes = nil
         }
 
+        if profilingStart { eval(inputEmbedsInit, trailingTextHidden, ttsPadEmbed); markStart("prompt") }
+
         // Cap max tokens based on text length
         let effectiveMaxTokens = frameBudget(text: text, maxTokens: maxTokens, tokenizer: tokenizer)
 
@@ -548,6 +612,36 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         var trailingIdx = 0
         var inputEmbeds = inputEmbedsInit
+        // Prompt prefix reuse (`fastPrefill`): restore the cached rows this
+        // prompt shares with the last one and prefill only the rest; a split
+        // prefill is bit-identical to one forward (QwenPrefillProbe).
+        var prefixToStore: PromptPrefixKV?
+        var prefixStoreRows = 0
+        if Self.fastPrefill, let c = iclConditioning {
+            let textIDs = c.referenceTextTokenIDs.asArray(Int32.self)
+            let headRows = Self.iclHeadRows(c)
+            // The role rows are the line's first 3 tokens (as in prepareICLGenerationInputs).
+            let roleIDs = tokenizer.encode(text: "<|im_start|>assistant\n\(text)<|im_end|>\n<|im_start|>assistant\n")
+                .prefix(3).map { Int32($0) }
+            if let cached = withInputPreparationCacheLock({ cachedPromptPrefix }),
+               cached.roleIDs == roleIDs, cached.headRows == headRows, cached.codecLanguageID == c.codecLanguageID,
+               cached.speakerEmbedding === c.speakerEmbedding {
+                var common = 0
+                while common < min(cached.textIDs.count, textIDs.count),
+                      cached.textIDs[common] == textIDs[common] { common += 1 }
+                let reuse = headRows + common
+                if reuse < inputEmbeds.dim(1) {
+                    for (layerCache, kv) in zip(cache, cached.kv) {
+                        var lc = layerCache   // a class; `state` is a protocol setter
+                        lc.state = kv.map { $0[.ellipsis, ..<reuse, 0...] }
+                    }
+                    inputEmbeds = inputEmbeds[0..., reuse..., 0...]
+                }
+            }
+            prefixStoreRows = headRows + textIDs.count
+            prefixToStore = PromptPrefixKV(roleIDs: roleIDs, textIDs: textIDs, codecLanguageID: c.codecLanguageID,
+                                           speakerEmbedding: c.speakerEmbedding, headRows: headRows, kv: [])
+        }
         let eosTokenArray = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
         let codeCache = talker.codePredictor.makeCache()
 
@@ -571,6 +665,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             }
         }
 
+        // Decoder priming, dispatched once: before the prefill (upstream) or,
+        // with `fastPrefill`, after frame 0 -- the first chunk is the first
+        // thing that needs it, so frame 0 no longer waits on it.
+        let fastPrefill = Self.fastPrefill
+        var pendingPrime: (() -> Void)?
+        func dispatchPrime() {
+            if let p = pendingPrime { pendingPrime = nil; p() }
+        }
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
             // ICL: run the reference codes through the streaming decoder first and drop their
@@ -579,14 +681,23 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             // Benson's first word came out an octave high (185-245 Hz vs 101-106 Hz), heard as a
             // voice crack. On the async path this overlaps prefill and the first chunk.
             if let refCodes {
-                let prime = { speechTokenizer.decoder.primeStreaming(refCodes) }
-                if Self.asyncDecode > 0 {
-                    decodeQueue.async {
-                        if Self.asyncDecode == 2 { Stream.withNewDefaultStream(device: Device(.gpu), prime) } else { prime() }
+                let prime: () -> Void = fastPrefill
+                    ? { [weak self] in self?.primeDecoder(speechTokenizer.decoder, on: refCodes) }
+                    : { speechTokenizer.decoder.primeStreaming(refCodes) }
+                pendingPrime = {
+                    if profilingStart {
+                        prime()
+                        markStart("prime")
+                    } else if Self.asyncDecode > 0 {
+                        decodeQueue.async {
+                            if Self.asyncDecode == 2 { Stream.withNewDefaultStream(device: Device(.gpu), prime) } else { prime() }
+                        }
+                    } else {
+                        prime()
                     }
-                } else {
-                    prime()
                 }
+                // The upstream order: primed before the prefill is built.
+                if !fastPrefill { dispatchPrime() }
             }
         }
         defer {
@@ -608,6 +719,17 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
             if Self.pipelineFrame { asyncEval(logits, hidden) }
+            if step == 0, let p = prefixToStore {
+                let kv = cache.map { layer in
+                    layer.state.map { contiguous($0[.ellipsis, ..<prefixStoreRows, 0...]) }
+                }
+                asyncEval(kv.flatMap { $0 })
+                let stored = PromptPrefixKV(roleIDs: p.roleIDs, textIDs: p.textIDs, codecLanguageID: p.codecLanguageID,
+                                            speakerEmbedding: p.speakerEmbedding, headRows: p.headRows, kv: kv)
+                withInputPreparationCacheLock { cachedPromptPrefix = stored }
+                prefixToStore = nil
+            }
+            if profilingStart, step == 0 { eval(logits, hidden); markStart("prefill") }
             if profiling { eval(logits, hidden); Self.profileAdd("talker", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Sample first codebook token
@@ -710,6 +832,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
             inputEmbeds = textEmbed + codecEmbed
             eval(inputEmbeds, isEOS)
+            if profilingStart, step == 0 { markStart("frame0") }
             if profiling { Self.profileAdd("nextInput", Date().timeIntervalSince(stageStart)); stageStart = Date(); Self.loopProfileFrames += 1 }
 
             let tokenId = Int(nextToken[0, 0].item(Int32.self))
@@ -718,6 +841,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 probe(step, logProbs[0, eosTokenId].item(Float.self), tokenId)
             }
             onToken?(tokenId)
+            dispatchPrime()
             if isEOS.item(Bool.self) {
                 Self.lastStopReason = .eos
                 break
@@ -887,10 +1011,15 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let lineTokens = tokenizer.encode(
             text: "<|im_start|>assistant\n\(text)<|im_end|>\n<|im_start|>assistant\n").count
         let line = max(0, lineTokens - 3 - 5)
-        let prefix = 3 + (conditioning.codecLanguageID == nil ? 3 : 4)
-            + (conditioning.speakerEmbedding == nil ? 0 : 1) + 2 - 1
+        let prefix = Self.iclHeadRows(conditioning)
         return prefix + conditioning.referenceTextTokenIDs.dim(1) + line + 1
             + 1 + conditioning.referenceSpeechCodes.dim(2)
+    }
+
+    /// Rows before the reference transcript in the ICL prompt: the role
+    /// (3) and the codec prefix (think/nothink, language, speaker, pad).
+    static func iclHeadRows(_ conditioning: Qwen3TTSReferenceConditioning) -> Int {
+        3 + (conditioning.codecLanguageID == nil ? 3 : 4) + (conditioning.speakerEmbedding == nil ? 0 : 1) + 2 - 1
     }
 
     /// The most frames a render of `text` may generate: `maxTokens`, capped

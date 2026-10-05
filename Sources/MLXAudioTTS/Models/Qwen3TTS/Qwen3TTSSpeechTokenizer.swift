@@ -988,7 +988,18 @@ final class Qwen3TTSSpeechTokenizerDecoder: Module {
     /// upsampler and decoder convs only keep a short history, so just the last `tailFrames`
     /// hidden frames go through them (8 frames covers their receptive field; this keeps the
     /// warm-up to a fraction of a chunk's decode instead of decoding the whole reference).
-    func primeStreaming(_ codes: MLXArray, tailFrames: Int = 12) {
+    ///
+    /// `trimmed` (2026-10-05) runs the same tail but drops, before each conv,
+    /// the leading samples that can no longer reach the state the stream keeps
+    /// (each conv's last `padding` inputs, each upsampler's overflow). The
+    /// tail's audio is thrown away, so only the samples feeding that state are
+    /// needed: at 24 kHz that is ~100 of the tail's 23,040, and the vocoder's
+    /// late blocks were most of the prime's cost. The kept samples see the
+    /// same inputs, so the state is the untrimmed tail's up to float
+    /// reordering: MLX's convs and matmuls tile by length, so shorter inputs
+    /// round differently (Mac: state within 4e-3, the next chunk's audio
+    /// within 2e-4, i.e. below -70 dBFS; `QwenPrefillProbe`).
+    func primeStreaming(_ codes: MLXArray, tailFrames: Int = 12, trimmed: Bool = false) {
         if transformerCache == nil {
             transformerCache = preTransformer.makeCache()
         }
@@ -999,7 +1010,134 @@ final class Qwen3TTSSpeechTokenizerDecoder: Module {
         hidden = hidden.transposed(0, 2, 1)
         let t = hidden.dim(2)
         let k = min(tailFrames, t)
-        eval(streamingUpsample(hidden[0..., 0..., (t - k)...]))
+        let tail = hidden[0..., 0..., (t - k)...]
+        if trimmed {
+            eval(streamingStateArrays(afterTrimmedTail: tail))
+        } else {
+            eval(streamingUpsample(tail))
+        }
+    }
+
+    // MARK: - Streaming state (prefill, 2026-10-05)
+
+    /// One streaming position of the decoder: the transformer's KV per layer
+    /// plus every conv's history and every upsampler's overflow. Arrays are
+    /// immutable values, so a snapshot stays valid while the stream moves on.
+    struct StreamingState: @unchecked Sendable {
+        let kv: [[MLXArray]]
+        let buffers: [MLXArray?]
+    }
+
+    /// Every conv history / overflow the streaming path keeps, in a fixed order.
+    private func forEachStreamBuffer(_ body: (inout MLXArray?) -> Void) {
+        body(&preConv.streamBuffer)
+        for layer in upsample {
+            for l in layer.layers {
+                if let cn = l as? ConvNeXtBlock { body(&cn.dwconv.streamBuffer) }
+            }
+        }
+        for layer in decoder {
+            if let l = layer as? DecoderInitialConv { body(&l.streamBuffer) }
+            if let l = layer as? DecoderOutputConv { body(&l.streamBuffer) }
+            if let b = layer as? DecoderBlock {
+                if let up = b.block[1] as? DecoderBlockUpsample { body(&up.overflow) }
+                for r in b.block.dropFirst(2) {
+                    if let r = r as? DecoderResidualUnit {
+                        body(&r.conv1.streamBuffer)
+                        body(&r.conv2.streamBuffer)
+                    }
+                }
+            }
+        }
+    }
+
+    func streamingState() -> StreamingState {
+        var buffers: [MLXArray?] = []
+        forEachStreamBuffer { buffers.append($0) }
+        return StreamingState(kv: (transformerCache ?? []).map { $0.state }, buffers: buffers)
+    }
+
+    func restoreStreamingState(_ state: StreamingState) {
+        let cache = preTransformer.makeCache()
+        // Fresh array handles: the cache writes into its keys/values in place.
+        for (layerCache, kv) in zip(cache, state.kv) where !kv.isEmpty {
+            var c = layerCache   // a class; `state` is a protocol setter
+            c.state = kv.map { $0[.ellipsis] }
+        }
+        transformerCache = cache
+        var i = 0
+        forEachStreamBuffer { buffer in
+            buffer = state.buffers[i]
+            i += 1
+        }
+    }
+
+    /// Runs `hidden` (the tail, `[1, latent, frames]`) through the upsampler
+    /// and vocoder from reset conv state, keeping at each step only the
+    /// trailing samples that reach the final state, and returns that state's
+    /// arrays (for eval). See `primeStreaming(_:tailFrames:trimmed:)`.
+    private func streamingStateArrays(afterTrimmedTail hidden: MLXArray) -> [MLXArray] {
+        // The chain as steps, each with how many trailing inputs it needs for
+        // `n` trailing outputs plus its own kept state.
+        typealias Step = (need: (Int) -> Int, run: (MLXArray) -> MLXArray)
+        var steps: [Step] = []
+        func conv(_ c: CausalConv1d) -> Int { c.paddingAmount }
+        for layer in upsample {
+            for l in layer.layers {
+                if let ct = l as? CausalTransposeConv1d {
+                    // kernel == stride: each input sample makes `stride` outputs, no history.
+                    let s = ct.conv.weight.dim(1)
+                    let exact = ct.trimRight == 0
+                    steps.append(({ n in exact ? (n + s - 1) / s : Int.max / 4 }, { ct($0) }))
+                } else if let cn = l as? ConvNeXtBlock {
+                    let p = conv(cn.dwconv)
+                    steps.append(({ n in n + p }, { cn.step($0) }))
+                }
+            }
+        }
+        for layer in decoder {
+            if let l = layer as? DecoderInitialConv {
+                let p = l.kernelSize - 1
+                steps.append(({ n in n + p }, { l.step($0) }))
+            } else if let b = layer as? DecoderBlock {
+                if let snake = b.block[0] as? SnakeBeta {
+                    steps.append(({ n in n }, { snake($0) }))
+                }
+                if let up = b.block[1] as? DecoderBlockUpsample {
+                    // kernel 2s, stride s: an output needs its input and the one
+                    // before; the overflow needs the last input.
+                    let s = up.trimRight
+                    steps.append(({ n in (n + s - 1) / s + 1 }, { up.step($0) }))
+                }
+                for r in b.block.dropFirst(2) {
+                    if let r = r as? DecoderResidualUnit {
+                        let p = conv(r.conv1) + conv(r.conv2)
+                        steps.append(({ n in n + p }, { r.step($0) }))
+                    }
+                }
+            } else if let l = layer as? DecoderOutputSnake {
+                steps.append(({ n in n }, { l($0) }))
+            } else if let l = layer as? DecoderOutputConv {
+                let p = l.kernelSize - 1
+                steps.append(({ n in n + p }, { l.step($0) }))
+            }
+        }
+        // Backward: inputs each step needs; the last step's output is not kept.
+        var needs = [Int](repeating: 0, count: steps.count)
+        var n = 0
+        for i in stride(from: steps.count - 1, through: 0, by: -1) {
+            n = steps[i].need(n)
+            needs[i] = n
+        }
+        var h = hidden
+        for (i, step) in steps.enumerated() {
+            let t = h.dim(2)
+            if t > needs[i] { h = h[0..., 0..., (t - needs[i])...] }
+            h = step.run(h)
+        }
+        var out: [MLXArray] = []
+        forEachStreamBuffer { if let b = $0 { out.append(b) } }
+        return out
     }
 
     private func streamingUpsample(_ hiddenIn: MLXArray) -> MLXArray {
