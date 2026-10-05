@@ -84,6 +84,35 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// instead of ~22 MLX launches. Prefill, and any layer whose weights are
     /// not 4- or 8-bit affine without biases, keep the module path.
     public nonisolated(unsafe) static var fusedLayers = false
+    /// With `fusedLayers` on (and `codePredictorMode` 0), run each frame's
+    /// code predictor as `Qwen3TTSFusedCodePredictor` (2026-10-05): residual
+    /// adds fused into the next norm, q/k glue + KV append in one kernel,
+    /// and (greedy sub-codes) argmax + next embedding + norm + the talker's
+    /// codec-embedding sum in one kernel — ~940 Metal dispatches a frame
+    /// instead of ~1,550, with bit-identical sub-codes. Off: the per-layer
+    /// fused path.
+    public nonisolated(unsafe) static var fusedCodePredictor = true
+    /// The fused code predictor's mode. true (default): exact — the same
+    /// sub-codes as the per-layer path, bit for bit. false: fast — one
+    /// attention kernel and a fused step 0, ~640 dispatches a frame, but
+    /// different bf16 rounding, so different (not worse) sub-codes.
+    public nonisolated(unsafe) static var fusedCodePredictorExact = true
+    /// Test hook: when set, every frame runs both code-predictor paths on
+    /// the same inputs and hands (per-layer, fused) sub-codes here; the
+    /// render follows the per-layer path. Greedy sub-codes only.
+    nonisolated(unsafe) static var subCodeParityProbe: (([MLXArray], [MLXArray]) -> Void)?
+    /// The probe's fused-side step-0 cache, one per loop cache: it must see
+    /// the same history (its buffers keep the dtype of the frame that
+    /// allocated them), so it lives as long as the loop's.
+    private nonisolated(unsafe) static var probeCaches: [ObjectIdentifier: [any KVCache]] = [:]
+    private func probeCache(for codeCache: [any KVCache]) -> [any KVCache] {
+        let key = ObjectIdentifier(codeCache[0] as AnyObject)
+        if let c = Self.probeCaches[key] { return c }
+        if Self.probeCaches.count > 8 { Self.probeCaches = [:] }
+        let c = talker.codePredictor.makeCache()
+        Self.probeCaches[key] = c
+        return c
+    }
     public nonisolated(unsafe) static var loopProfile: [String: Double] = [:]
     public nonisolated(unsafe) static var loopProfileFrames = 0
     /// Stop diagnostics (stop-variance probe, 2026-09-09): read-only
@@ -756,60 +785,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             }
 
             // Generate remaining codebook tokens with code predictor
-            var codeTokens = [nextToken]
-            let codeHidden = hidden[0..., (-1)..., 0...]
-            for layerCache in codeCache {
-                _ = layerCache.trim(layerCache.offset)
-            }
-
-            if Self.codePredictorMode > 0 {
-                // Prefix grows by one embedding per step; each step is one
-                // compiled graph over the whole (tiny) prefix.
-                var prefix = concatenated([codeHidden, talker.getInputEmbeddings()(nextToken)], axis: 1)
-                for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
-                    if codeIdx > 0 {
-                        prefix = concatenated(
-                            [prefix, talker.codePredictor.codecEmbedding[codeIdx - 1](codeTokens.last!)], axis: 1)
-                    }
-                    let codeLogits = Self.codePredictorMode >= 2
-                        ? talker.codePredictor.compiledLogits(prefix: prefix, step: codeIdx,
-                                                              withState: Self.codePredictorMode == 2)
-                        : talker.codePredictor.logitsNoCache(prefix: prefix, step: codeIdx)
-                    let nextCode = sampleToken(
-                        codeLogits,
-                        temperature: Self.greedySubCodes ? 0 : temperature,
-                        topP: topP,
-                        topK: topK,
-                        minP: minP
-                    )
-                    codeTokens.append(nextCode)
-                    if Self.pipelineFrame { asyncEval(nextCode) }
-                }
-            } else {
-            for codeIdx in 0 ..< talkerConfig.numCodeGroups - 1 {
-                let codeInput: MLXArray
-                if codeIdx == 0 {
-                    let code0Embed = talker.getInputEmbeddings()(nextToken)
-                    codeInput = concatenated([codeHidden, code0Embed], axis: 1)
-                } else {
-                    codeInput = talker.codePredictor.codecEmbedding[codeIdx - 1](codeTokens.last!)
-                }
-
-                let (codeLogits, _, _) = talker.codePredictor(
-                    codeInput, cache: codeCache, generationStep: codeIdx
-                )
-
-                let nextCode = sampleToken(
-                    codeLogits,
-                    temperature: Self.greedySubCodes ? 0 : temperature,
-                    topP: topP,
-                    topK: topK,
-                    minP: minP
-                )
-                codeTokens.append(nextCode)
-                if Self.pipelineFrame { asyncEval(nextCode) }
-            }
-            }
+            let subCodes = predictSubCodes(
+                hidden: hidden, nextToken: nextToken, codeCache: codeCache,
+                temperature: temperature, topP: topP, topK: topK, minP: minP)
+            let codeTokens = [nextToken] + subCodes.codes
 
             let allCodes = concatenated(codeTokens, axis: 1) // [1, num_code_groups]
             if profiling { eval(allCodes); Self.profileAdd("codePredictor", Date().timeIntervalSince(stageStart)); stageStart = Date() }
@@ -824,10 +803,16 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 textEmbed = ttsPadEmbed
             }
 
-            // Sum all code embeddings for next step
-            var codecEmbed = talker.getInputEmbeddings()(nextToken)
-            for (i, code) in codeTokens.dropFirst().enumerated() {
-                codecEmbed = codecEmbed + talker.codePredictor.codecEmbedding[i](code)
+            // Sum all code embeddings for next step (the fused code
+            // predictor hands back this exact sum, made as it went)
+            var codecEmbed: MLXArray
+            if let sum = subCodes.codecEmbedSum {
+                codecEmbed = sum
+            } else {
+                codecEmbed = talker.getInputEmbeddings()(nextToken)
+                for (i, code) in codeTokens.dropFirst().enumerated() {
+                    codecEmbed = codecEmbed + talker.codePredictor.codecEmbedding[i](code)
+                }
             }
 
             inputEmbeds = textEmbed + codecEmbed
@@ -1432,6 +1417,96 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     }
 
     // MARK: - Token sampling
+
+    /// Code-predictor half of a frame: sub-codes 1…15 for code 0
+    /// `nextToken` and the talker's `hidden` output. With the fused code
+    /// predictor engaged (see `fusedCodePredictor`) it also returns the
+    /// summed codec embedding the next talker step takes; otherwise nil and
+    /// the loop sums it.
+    func predictSubCodes(
+        hidden: MLXArray, nextToken: MLXArray, codeCache: [any KVCache],
+        temperature: Float, topP: Float, topK: Int, minP: Float
+    ) -> (codes: [MLXArray], codecEmbedSum: MLXArray?) {
+        let numCodeGroups = talker.codePredictor.numCodeGroups
+        let codeHidden = hidden[0..., (-1)..., 0...]
+        if let probe = Self.subCodeParityProbe, let fused = talker.codePredictor.fusedFrame() {
+            // Parity probe: both paths on this frame's inputs; the render follows the per-layer path.
+            let frame = fused.frame(
+                codeHidden: codeHidden, code0Embed: talker.getInputEmbeddings()(nextToken),
+                stepZeroCache: probeCache(for: codeCache), greedy: true, pipeline: false) { _ in fatalError("greedy") }
+            let wasFused = Self.fusedCodePredictor
+            Self.subCodeParityProbe = nil; Self.fusedCodePredictor = false
+            defer { Self.subCodeParityProbe = probe; Self.fusedCodePredictor = wasFused }
+            let reference = predictSubCodes(hidden: hidden, nextToken: nextToken, codeCache: codeCache,
+                                            temperature: temperature, topP: topP, topK: topK, minP: minP)
+            probe(reference.codes, frame.codes)
+            return reference
+        }
+        if Self.codePredictorMode == 0, Self.fusedLayers, Self.fusedCodePredictor,
+           let fused = talker.codePredictor.fusedFrame() {
+            let frame = fused.frame(
+                codeHidden: codeHidden, code0Embed: talker.getInputEmbeddings()(nextToken),
+                stepZeroCache: codeCache, greedy: Self.greedySubCodes, pipeline: Self.pipelineFrame
+            ) { logits in
+                self.sampleToken(logits, temperature: temperature, topP: topP, topK: topK, minP: minP)
+            }
+            return (frame.codes, frame.codecEmbedSum)
+        }
+        var codeTokens = [nextToken]
+        for layerCache in codeCache {
+            _ = layerCache.trim(layerCache.offset)
+        }
+
+        if Self.codePredictorMode > 0 {
+            // Prefix grows by one embedding per step; each step is one
+            // compiled graph over the whole (tiny) prefix.
+            var prefix = concatenated([codeHidden, talker.getInputEmbeddings()(nextToken)], axis: 1)
+            for codeIdx in 0 ..< numCodeGroups - 1 {
+                if codeIdx > 0 {
+                    prefix = concatenated(
+                        [prefix, talker.codePredictor.codecEmbedding[codeIdx - 1](codeTokens.last!)], axis: 1)
+                }
+                let codeLogits = Self.codePredictorMode >= 2
+                    ? talker.codePredictor.compiledLogits(prefix: prefix, step: codeIdx,
+                                                          withState: Self.codePredictorMode == 2)
+                    : talker.codePredictor.logitsNoCache(prefix: prefix, step: codeIdx)
+                let nextCode = sampleToken(
+                    codeLogits,
+                    temperature: Self.greedySubCodes ? 0 : temperature,
+                    topP: topP,
+                    topK: topK,
+                    minP: minP
+                )
+                codeTokens.append(nextCode)
+                if Self.pipelineFrame { asyncEval(nextCode) }
+            }
+        } else {
+            for codeIdx in 0 ..< numCodeGroups - 1 {
+                let codeInput: MLXArray
+                if codeIdx == 0 {
+                    let code0Embed = talker.getInputEmbeddings()(nextToken)
+                    codeInput = concatenated([codeHidden, code0Embed], axis: 1)
+                } else {
+                    codeInput = talker.codePredictor.codecEmbedding[codeIdx - 1](codeTokens.last!)
+                }
+
+                let (codeLogits, _, _) = talker.codePredictor(
+                    codeInput, cache: codeCache, generationStep: codeIdx
+                )
+
+                let nextCode = sampleToken(
+                    codeLogits,
+                    temperature: Self.greedySubCodes ? 0 : temperature,
+                    topP: topP,
+                    topK: topK,
+                    minP: minP
+                )
+                codeTokens.append(nextCode)
+                if Self.pipelineFrame { asyncEval(nextCode) }
+            }
+        }
+        return (Array(codeTokens.dropFirst()), nil)
+    }
 
     func sampleToken(
         _ logits: MLXArray,
