@@ -178,6 +178,24 @@ final class QwenContinuationTests: XCTestCase {
         XCTAssertNotNil(Qwen3TTSModel.lastGeneratedCodes)
     }
 
+    /// `fastSample0` (GPU-resident suppression / repetition masks) must
+    /// render the same codes as the upstream sampler for one seed. The
+    /// silence stop is off here because its async timing can move the stop.
+    func testFastSample0RendersTheSameCodes() async throws {
+        let (model, c) = try base()
+        Qwen3TTSModel.trailingSilenceStopSeconds = 0
+        defer { Qwen3TTSModel.fastSample0 = true }
+        func codes(fast: Bool) async throws -> [Int32] {
+            Qwen3TTSModel.fastSample0 = fast
+            let t = try await take(model, "Good evening, night owls.", c, rng: MLXRandom.RandomState(seed: 42))
+            return try XCTUnwrap(t.codes).asArray(Int32.self)
+        }
+        let old = try await codes(fast: false)
+        let new = try await codes(fast: true)
+        XCTAssertFalse(old.isEmpty)
+        XCTAssertEqual(new, old)
+    }
+
     // MARK: - A/B probe (QWEN_CARRY_PROBE=1)
 
     /// Renders a four-part read with and without the carry, several seeds

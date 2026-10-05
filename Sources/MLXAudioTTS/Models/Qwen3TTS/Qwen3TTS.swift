@@ -49,6 +49,17 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     public nonisolated(unsafe) static var skipLoopCacheClear = false
     /// Greedy (argmax) sub-codebooks 1…15; only the first codebook samples.
     public nonisolated(unsafe) static var greedySubCodes = false
+    /// First-codebook sampler with per-generation GPU state (iOS profile,
+    /// 2026-10-04: "sample0" cost 11-16 ms a frame on an iPhone 15 Pro).
+    /// The suppression set (~1,023 ids) becomes one boolean mask built once
+    /// per generation instead of a host array + scatter every frame; the
+    /// repetition-penalty history becomes a GPU presence mask updated with
+    /// the new token instead of a Swift `Set` re-uploaded and gathered /
+    /// scattered every frame; and the EOS save/restore is skipped when no
+    /// top-k/top-p/min-p filter runs (it is the identity then). Outputs are
+    /// bit-identical to `sampleToken` for the same seed and parameters
+    /// (`QwenSample0ParityTests`). Off = the upstream `sampleToken` path.
+    public nonisolated(unsafe) static var fastSample0 = true
     /// Streaming decode off the generation thread: 0 = inline (upstream),
     /// 1 = a serial background queue on the same GPU stream (the loop no
     /// longer waits for the decoder's GPU work), 2 = same, on a fresh GPU
@@ -535,6 +546,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         // Suppress special tokens
         let suppressTokens = (talkerConfig.vocabSize - 1024 ..< talkerConfig.vocabSize)
             .filter { $0 != eosTokenId }
+        let useFastSample0 = Self.fastSample0
+        let sample0State = useFastSample0
+            ? Sample0State(vocabSize: talkerConfig.vocabSize, suppressTokens: suppressTokens, eosTokenId: eosTokenId)
+            : nil
 
         // Streaming decode state
         let codecTokenRateHz = 12.5
@@ -611,18 +626,31 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             if profiling { eval(logits, hidden); Self.profileAdd("talker", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
             // Sample first codebook token
-            let nextToken = sampleToken(
-                logits,
-                temperature: temperature,
-                topP: topP,
-                topK: topK,
-                repetitionPenalty: repetitionPenalty,
-                generatedTokens: generatedCodebookTokens,
-                suppressTokens: suppressTokens,
-                eosTokenId: eosTokenId,
-                minP: minP,
-                eosLogitBias: Self.eosLogitBias
-            )
+            let nextToken = if let sample0State {
+                Self.sampleFirstCode(
+                    logits,
+                    state: sample0State,
+                    temperature: temperature,
+                    topP: topP,
+                    topK: topK,
+                    repetitionPenalty: repetitionPenalty,
+                    minP: minP,
+                    eosLogitBias: Self.eosLogitBias
+                )
+            } else {
+                Self.sampleToken(
+                    logits,
+                    temperature: temperature,
+                    topP: topP,
+                    topK: topK,
+                    repetitionPenalty: repetitionPenalty,
+                    generatedTokens: generatedCodebookTokens,
+                    suppressTokens: suppressTokens,
+                    eosTokenId: eosTokenId,
+                    minP: minP,
+                    eosLogitBias: Self.eosLogitBias
+                )
+            }
 
             if profiling { eval(nextToken); Self.profileAdd("sample0", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
@@ -653,7 +681,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                         ? talker.codePredictor.compiledLogits(prefix: prefix, step: codeIdx,
                                                               withState: Self.codePredictorMode == 2)
                         : talker.codePredictor.logitsNoCache(prefix: prefix, step: codeIdx)
-                    let nextCode = sampleToken(
+                    let nextCode = Self.sampleToken(
                         codeLogits,
                         temperature: Self.greedySubCodes ? 0 : temperature,
                         topP: topP,
@@ -677,7 +705,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                     codeInput, cache: codeCache, generationStep: codeIdx
                 )
 
-                let nextCode = sampleToken(
+                let nextCode = Self.sampleToken(
                     codeLogits,
                     temperature: Self.greedySubCodes ? 0 : temperature,
                     topP: topP,
@@ -723,6 +751,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
                 break
             }
             generatedCodebookTokens.append(tokenId)
+            if repetitionPenalty != 1.0 { sample0State?.note(tokenId) }
             generatedCodes.append(allCodes)
 
             // Streaming: decode and yield audio chunks during generation
@@ -1304,7 +1333,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     // MARK: - Token sampling
 
-    func sampleToken(
+    static func sampleToken(
         _ logits: MLXArray,
         temperature: Float = 0.9,
         topP: Float = 1.0,
@@ -1426,6 +1455,127 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         // Sample with temperature
         let token = categorical(filteredLogits / temperature)
         return token.reshaped(1, 1)
+    }
+
+    /// Per-generation state for `sampleFirstCode` (see `fastSample0`).
+    final class Sample0State {
+        let vocabSize: Int
+        let eosTokenId: Int?
+        /// [1, vocab] true where the token is suppressed (set to -inf).
+        let suppressMask: MLXArray?
+        /// [1, vocab] true where the token was generated before.
+        private(set) var presence: MLXArray
+        private(set) var hasHistory = false
+        let eosIdx: MLXArray?
+        private let vocabIds: MLXArray
+        private var negInfByDType: [DType: MLXArray] = [:]
+
+        init(vocabSize: Int, suppressTokens: [Int], eosTokenId: Int?) {
+            self.vocabSize = vocabSize
+            let validEos = eosTokenId.flatMap { $0 >= 0 && $0 < vocabSize ? $0 : nil }
+            self.eosTokenId = validEos
+            var mask = [Bool](repeating: false, count: vocabSize)
+            for t in suppressTokens where t >= 0 && t < vocabSize { mask[t] = true }
+            suppressMask = suppressTokens.isEmpty ? nil : MLXArray(mask).reshaped(1, vocabSize)
+            presence = MLXArray.zeros([1, vocabSize], type: Bool.self)
+            vocabIds = MLXArray((0 ..< vocabSize).map { Int32($0) }).reshaped(1, vocabSize)
+            eosIdx = validEos.map { MLXArray([Int32($0)]).reshaped(1, 1) }
+            var toEval = [presence, vocabIds]
+            if let suppressMask { toEval.append(suppressMask) }
+            if let eosIdx { toEval.append(eosIdx) }
+            eval(toEval)
+        }
+
+        /// Record a generated token for the repetition penalty (lazy; it is
+        /// materialised with the next frame's sample).
+        func note(_ tokenId: Int) {
+            guard tokenId >= 0, tokenId < vocabSize else { return }
+            presence = logicalOr(presence, vocabIds .== MLXArray(Int32(tokenId)))
+            hasHistory = true
+        }
+
+        func negInf(_ dtype: DType) -> MLXArray {
+            if let cached = negInfByDType[dtype] { return cached }
+            let v = MLXArray(-Float.infinity).asType(dtype)
+            eval(v)
+            negInfByDType[dtype] = v
+            return v
+        }
+    }
+
+    /// `sampleToken` for the first codebook with GPU-resident suppression and
+    /// repetition state. Bit-identical to `sampleToken(logits, …,
+    /// generatedTokens: <tokens noted in state>, suppressTokens: <state's>,
+    /// eosTokenId: <state's>, …)` for the same random state.
+    static func sampleFirstCode(
+        _ logits: MLXArray,
+        state: Sample0State,
+        temperature: Float,
+        topP: Float,
+        topK: Int,
+        repetitionPenalty: Float,
+        minP: Float,
+        eosLogitBias: Float
+    ) -> MLXArray {
+        let logitsSlice = sample0Logits(
+            logits, state: state, repetitionPenalty: repetitionPenalty, eosLogitBias: eosLogitBias)
+
+        if temperature <= 0 {
+            return argMax(logitsSlice, axis: -1, keepDims: true)
+        }
+
+        let vocabSize = logitsSlice.dim(-1)
+        let applyTopK = topK > 0 && topK < vocabSize
+        let applyTopP = topP > 0 && topP < 1.0
+        let applyMinP = minP > 0.0
+        // No filter -> filtered == logitsSlice and restoring EOS is the
+        // identity, so the fast path is just the categorical draw.
+        guard applyTopK || applyTopP || applyMinP else {
+            return categorical(logitsSlice / temperature).reshaped(1, 1)
+        }
+        // Filters: identical to `sampleToken` from here on.
+        return sampleToken(
+            logitsSlice.expandedDimensions(axis: 1),
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            eosTokenId: state.eosTokenId,
+            minP: minP
+        )
+    }
+
+    /// The bias / suppression / repetition-penalty stage of `sampleFirstCode`:
+    /// [1, 1, vocab] or [1, T, vocab] logits -> [1, vocab].
+    static func sample0Logits(
+        _ logits: MLXArray,
+        state: Sample0State,
+        repetitionPenalty: Float,
+        eosLogitBias: Float
+    ) -> MLXArray {
+        var logitsSlice = logits[0..., (-1)..., 0...].squeezed(axis: 1) // [1, vocab]
+        precondition(logitsSlice.dim(-1) == state.vocabSize, "sample0 state vocab mismatch")
+
+        if eosLogitBias != 0, let eosIdx = state.eosIdx {
+            let biased = takeAlong(logitsSlice, eosIdx, axis: -1) + MLXArray(eosLogitBias).asType(logitsSlice.dtype)
+            logitsSlice = putAlong(logitsSlice, eosIdx, values: biased, axis: -1)
+        }
+
+        // Suppressed ids -> -inf (same values the scatter wrote).
+        if let suppressMask = state.suppressMask {
+            logitsSlice = which(suppressMask, state.negInf(logitsSlice.dtype), logitsSlice)
+        }
+
+        // Repetition penalty on previously generated ids, elementwise the
+        // same arithmetic as the gather/scatter path.
+        if state.hasHistory, repetitionPenalty != 1.0 {
+            let penalized = which(
+                logitsSlice .< 0,
+                logitsSlice * repetitionPenalty,
+                logitsSlice / repetitionPenalty
+            )
+            logitsSlice = which(state.presence, penalized, logitsSlice)
+        }
+        return logitsSlice
     }
 
     // MARK: - fromPretrained
