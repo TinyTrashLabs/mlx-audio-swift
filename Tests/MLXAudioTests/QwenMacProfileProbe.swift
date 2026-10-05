@@ -31,6 +31,10 @@ final class QwenMacProfileProbe: XCTestCase {
     static let fused = (env["QWEN_PROFILE_FUSED"] ?? "1") != "0"
     static let asyncDecode = Int(env["QWEN_PROFILE_ASYNC_DECODE"] ?? "0") ?? 0
     static let pipeline = (env["QWEN_PROFILE_PIPELINE"] ?? "0") != "0"
+    /// `Qwen3TTSModel.fusedCodePredictor` (default 1); `QWEN_PROFILE_CP_FAST=1`
+    /// selects its fast (not bit-identical) mode.
+    static let fusedCP = (env["QWEN_PROFILE_FUSED_CP"] ?? "1") != "0"
+    static let fastCP = env["QWEN_PROFILE_CP_FAST"] == "1"
     /// Seconds of trailing near-silence that stop a render (the app uses 1.5);
     /// 0 disables the backstop so a render's true length can be seen.
     static let silenceStop = Double(env["QWEN_PROFILE_SILENCE_STOP"] ?? "1.5") ?? 1.5
@@ -50,15 +54,19 @@ final class QwenMacProfileProbe: XCTestCase {
         Qwen3TTSModel.trailingSilenceStopSeconds = Self.silenceStop
         Qwen3TTSModel.asyncDecode = Self.asyncDecode
         Qwen3TTSModel.pipelineFrame = Self.pipeline
+        Qwen3TTSModel.fusedCodePredictor = Self.fusedCP
+        Qwen3TTSFusedCodePredictor.exact = !Self.fastCP
         defer {
+            Qwen3TTSModel.fusedCodePredictor = true; Qwen3TTSFusedCodePredictor.exact = true
             Qwen3TTSModel.greedySubCodes = false; Qwen3TTSModel.fusedLayers = false
             Qwen3TTSModel.eosGreedyStop = false; Qwen3TTSModel.trailingSilenceStopSeconds = 0
             Qwen3TTSModel.asyncDecode = 0; Qwen3TTSModel.profileLoop = false; Qwen3TTSModel.pipelineFrame = false
         }
         let loadStart = Date()
         let model = try await Qwen3TTSModel.fromModelDirectory(weightsDir)
-        print(String(format: "[macprofile] %@ loaded in %.1f s (fused %d, asyncDecode %d, pipeline %d, silenceStop %.1f)",
-                     weightsDir.lastPathComponent, Date().timeIntervalSince(loadStart), Self.fused ? 1 : 0, Self.asyncDecode, Self.pipeline ? 1 : 0, Self.silenceStop))
+        print(String(format: "[macprofile] %@ loaded in %.1f s (fused %d, fusedCP %d%@, asyncDecode %d, pipeline %d, silenceStop %.1f)",
+                     weightsDir.lastPathComponent, Date().timeIntervalSince(loadStart), Self.fused ? 1 : 0, Self.fusedCP ? 1 : 0,
+                     Self.fastCP ? " fast" : "", Self.asyncDecode, Self.pipeline ? 1 : 0, Self.silenceStop))
         let meta = try JSONSerialization.jsonObject(with: Data(contentsOf: voiceDir.appendingPathComponent("meta.json"))) as? [String: Any]
         let refText = try XCTUnwrap(meta?["refText"] as? String)
         let (_, refAudio) = try loadAudioArray(from: voiceDir.appendingPathComponent("ref.wav"), sampleRate: model.sampleRate)
@@ -119,8 +127,8 @@ final class QwenMacProfileProbe: XCTestCase {
             rates.append(Double(r.frames) / r.seconds)
         }
         let sorted = rates.sorted()
-        print(String(format: "[macprofile] RESULT %@ fused=%d pipeline=%d asyncDecode=%d: best %.1f f/s, median %.1f f/s, worst %.1f f/s (%d renders)",
-                     weightsDir.lastPathComponent, Self.fused ? 1 : 0, Self.pipeline ? 1 : 0, Self.asyncDecode,
-                     sorted.last!, sorted[sorted.count / 2], sorted.first!, sorted.count))
+        print(String(format: "[macprofile] RESULT %@ fused=%d fusedCP=%d%@ pipeline=%d asyncDecode=%d: best %.1f f/s, median %.1f f/s, worst %.1f f/s (%d renders)",
+                     weightsDir.lastPathComponent, Self.fused ? 1 : 0, Self.fusedCP ? 1 : 0, Self.fastCP ? " fast" : "",
+                     Self.pipeline ? 1 : 0, Self.asyncDecode, sorted.last!, sorted[sorted.count / 2], sorted.first!, sorted.count))
     }
 }
