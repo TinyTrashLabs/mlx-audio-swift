@@ -84,6 +84,18 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// the "hiss to the token cap" failure the phone produced at 25.44 s.
     public nonisolated(unsafe) static var trailingSilenceStopSeconds: Double = 0
     public nonisolated(unsafe) static var trailingSilenceFloorDb: Float = -35
+    /// Streaming only: codec frames ([1, groups, T]) pushed through the
+    /// freshly reset decoder before the first chunk, their audio discarded.
+    /// A cold decoder starts every generation with a ~60 ms pop; a caller
+    /// stitching parts sets this to the previous part's `lastCodesTail` so
+    /// the next part decodes as a continuation of what was just playing.
+    /// nil = cold start (upstream).
+    public nonisolated(unsafe) static var streamPrimeCodes: MLXArray?
+    /// The last `joinContextFrames` codec frames of the most recent
+    /// generation ([1, groups, T]), or nil if it produced none.
+    public nonisolated(unsafe) static var lastCodesTail: MLXArray?
+    /// 2 s at 12.5 Hz, the decoder's own left context (`chunkedDecode`).
+    public nonisolated(unsafe) static var joinContextFrames = 25
     private static func profileAdd(_ key: String, _ seconds: Double) {
         loopProfile[key, default: 0] += seconds
     }
@@ -562,6 +574,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         if onAudioChunk != nil {
             speechTokenizer.decoder.resetStreamingState()
+            // Warm the decoder on the previous part's tail (see
+            // `streamPrimeCodes`); its audio was already played.
+            if let prime = Self.streamPrimeCodes, prime.dim(2) > 0 {
+                eval(speechTokenizer.decoder.streamingStep(prime))
+            }
         }
         defer {
             if onAudioChunk != nil {
@@ -730,6 +747,14 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         try Task.checkCancellation()
         if Self.lastStopReason == nil { Self.lastStopReason = .maxTokens }
         Self.lastFrameCount = generatedCodes.count
+        if generatedCodes.isEmpty {
+            Self.lastCodesTail = nil
+        } else {
+            let tail = stacked(Array(generatedCodes.suffix(max(1, Self.joinContextFrames))), axis: 1)
+                .transposed(0, 2, 1)
+            eval(tail)
+            Self.lastCodesTail = tail
+        }
 
         guard !generatedCodes.isEmpty else {
             return MLXArray.zeros([1])
