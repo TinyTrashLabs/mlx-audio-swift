@@ -335,7 +335,7 @@ final class QwenFusedCodePredictorTests: XCTestCase {
         setUpRealRun()
         let model = try await Qwen3TTSModel.fromModelDirectory(weightsDir)
         let talker = model.talker
-        let hidden = 2 * MLXRandom.normal([1, 1, 1024])                 // float32, as the talker's
+        let hidden = 2 * MLXRandom.normal([1, 1, talker.codePredictor.talkerHiddenSize])  // float32, as the talker's
         let token = MLXArray([Int32(1234)]).reshaped(1, 1)
         let codeCache = talker.codePredictor.makeCache()
         func frame() -> [MLXArray] {

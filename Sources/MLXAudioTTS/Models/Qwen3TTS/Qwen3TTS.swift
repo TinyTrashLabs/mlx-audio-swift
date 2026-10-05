@@ -68,12 +68,18 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// not 4- or 8-bit affine without biases, keep the module path.
     public nonisolated(unsafe) static var fusedLayers = false
     /// With `fusedLayers` on (and `codePredictorMode` 0), run each frame's
-    /// code predictor as `Qwen3TTSFusedCodePredictor`: one attention kernel
-    /// over the 16-row cache, residual adds fused into the next norm, and
-    /// (greedy sub-codes) argmax + next embedding + norm in one kernel —
-    /// ~42 launches a sub-step instead of ~70. Same sub-codes as the
-    /// per-layer fused path (see the type). Off: that per-layer path.
+    /// code predictor as `Qwen3TTSFusedCodePredictor` (2026-10-05): residual
+    /// adds fused into the next norm, q/k glue + KV append in one kernel,
+    /// and (greedy sub-codes) argmax + next embedding + norm + the talker's
+    /// codec-embedding sum in one kernel — ~940 Metal dispatches a frame
+    /// instead of ~1,550, with bit-identical sub-codes. Off: the per-layer
+    /// fused path.
     public nonisolated(unsafe) static var fusedCodePredictor = true
+    /// The fused code predictor's mode. true (default): exact — the same
+    /// sub-codes as the per-layer path, bit for bit. false: fast — one
+    /// attention kernel and a fused step 0, ~640 dispatches a frame, but
+    /// different bf16 rounding, so different (not worse) sub-codes.
+    public nonisolated(unsafe) static var fusedCodePredictorExact = true
     /// Test hook: when set, every frame runs both code-predictor paths on
     /// the same inputs and hands (per-layer, fused) sub-codes here; the
     /// render follows the per-layer path. Greedy sub-codes only.

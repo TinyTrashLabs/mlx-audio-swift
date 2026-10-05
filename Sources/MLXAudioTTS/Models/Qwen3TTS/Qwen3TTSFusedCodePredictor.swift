@@ -8,36 +8,40 @@ import MLXNN
 // The code predictor runs 5 layers × 15 sequential sub-steps a frame and,
 // on a hot iPhone 15 Pro, is ~70% of the frame (62–71 ms of ~92). The work
 // is tiny — one token, attention over at most 16 rows — so the frame is
-// bound by kernel launches, whose cost grows with throttled clocks. The
-// per-layer fused step (`Qwen3TTSFusedStep`, hybrid) already took a layer
-// from ~22 launches to ~13; this takes the whole frame further:
+// bound by kernel launches, whose cost grows with throttled clocks. With
+// the per-layer fused step (`Qwen3TTSFusedStep`, hybrid) a frame's code
+// predictor was still ~1,550 Metal dispatches (counted on the Mac, 0.6B
+// 4-bit mobile). This runs the whole frame:
 //
-//   * attention is one kernel: q/k head rmsnorm + RoPE, the KV append and
-//     the softmax·V over the ≤16-row cache (`cp_attn`). The cache is a
-//     (1, kvHeads, 16, 128) array per layer that the kernel copies forward,
-//     so there is no KVCacheSimple slice-update / 256-row buffer per step,
-//     and no separate SDPA (on the phone SDPA is the unfused fallback plus
-//     a float32 → bf16 cast);
 //   * a layer's closing residual add is fused with the next layer's input
-//     rmsnorm (or the final norm) (`cp_add_rms`);
+//     rmsnorm, or the final norm (`cp_add_rms`, MLX's `rms_single_row`
+//     reproduced);
+//   * the q/k head norm + RoPE glue writes q and appends k/v to a per-frame
+//     (1, kvHeads, 16, 128) cache in one kernel (`cp_exact_glue`) — no
+//     KVCacheSimple slice updates or SDPA-side casts;
 //   * for greedy sub-codes, argmax + the next sub-step's embedding lookup +
 //     layer 0's input rmsnorm + the running codec-embedding sum the talker
-//     needs next frame are one kernel (`cp_argmax_embed`);
-//   * step 0's two rows (talker hidden, code-0 embedding) run through the
-//     same kernels as a two-row step instead of the module path.
+//     takes next frame are one kernel (`cp_argmax_embed`);
+//   * q/k/v, o, gate/up and down stay MLX's quantized matmul (it measured
+//     faster on the phone than hand-written matvecs).
 //
-// Per layer that is 8 launches (q/k/v, o, gate/up and down stay MLX's
-// quantized matmul, which measured faster on the phone than hand-written
-// matvecs) and per sub-step 42, against ~70 for the per-layer fused step.
+// Exact mode (default, `Qwen3TTSModel.fusedCodePredictorExact`): ~940
+// dispatches a frame, and bit-identical sub-codes — which is the only kind
+// of parity there is here: the sub-code logits are bf16 with top-two gaps
+// of 0 or one ulp in most frames, so any rounding change flips greedy
+// codes in about two frames of three. So exact mode reproduces the
+// per-layer path op for op: step 0 is that path's own module pass (in the
+// float32 the talker's first hidden state arrives in, leaving the float32
+// cache buffers every later frame writes into), attention is MLX's SDPA
+// over the frame's cache, and every custom kernel matches the MLX ops it
+// replaces bit for bit (`QwenFusedCodePredictorTests`).
 //
-// Numerics: everything the kernels replace is written to reproduce MLX's
-// own kernels operation for operation — the SDPA "vector" kernel's
-// reduction layout, `rms_single_row`'s, bf16 `a + b` in the activation
-// type, argmax's lowest-index tie break — and the q/k glue is
-// `Qwen3TTSFusedStep`'s. The sub-step graph is therefore bit-identical to
-// the per-layer fused path except at step 0 (which that path ran through
-// the module code). `QwenFusedCodePredictorTests` pins the kernels and
-// whole frames; see the PR for long-render code parity.
+// Fast mode (`fusedCodePredictorExact = false`): ~640 dispatches. Attention
+// is one kernel over the cache (`cp_attn`, MLX's sdpa_vector line for line,
+// but a runtime-compiled kernel is not fast-math like MLX's metallib, so
+// ~1 output in 10^4 lands an ulp apart) and step 0 is a fused two-row bf16
+// step. Different rounding, so different — equally valid, not identical —
+// sub-codes.
 final class Qwen3TTSFusedCodePredictor {
     let layers: [Qwen3TTSFusedStep.Layer]
     let finalNorm: MLXArray
@@ -142,17 +146,12 @@ final class Qwen3TTSFusedCodePredictor {
         return qmm(last, head.weight, head.scales, head.biases, bits: head.bits, groupSize: head.groupSize)
     }
 
-    /// Exact mode (default): sub-steps 1…14 reproduce the per-layer
-    /// fused path's arithmetic op for op, so the sub-codes are bit-identical
-    /// (greedy sub-codes sit on bf16 near-ties — top-two gaps of 0 or one
-    /// ulp are common — so anything less flips codes in most frames). Step
-    /// 0 runs the module path (in the talker hidden's float32, as the loop
-    /// always has), attention is MLX's SDPA over this frame's cache, and the
-    /// float32 cache those float32 step-0 rows leave behind is kept.
-    /// Off: the fast mode — one attention kernel (`cp_attn`) and step 0 as
-    /// a fused two-row bf16 step; ~150 fewer launches a frame, but
-    /// different bf16 rounding, so different (equally valid) sub-codes.
-    nonisolated(unsafe) static var exact = true
+    /// Exact or fast mode (see the top of the file); forwards to
+    /// `Qwen3TTSModel.fusedCodePredictorExact`.
+    static var exact: Bool {
+        get { Qwen3TTSModel.fusedCodePredictorExact }
+        set { Qwen3TTSModel.fusedCodePredictorExact = newValue }
+    }
 
     /// One layer of an exact sub-step (one row at cache position `pos`).
     private func exactLayerStep(_ x: MLXArray, _ normed: MLXArray, _ layer: Qwen3TTSFusedStep.Layer, nextNorm: MLXArray,
