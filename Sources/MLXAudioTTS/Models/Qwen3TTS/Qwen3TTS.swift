@@ -27,6 +27,18 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     /// The streaming decoder's state after priming on `codes` (`fastPrefill`):
     /// a line that starts from the same reference restores it instead of
     /// priming again. Held strongly, so the identity check cannot alias.
+    /// The talker's keys/values for the last ICL prompt's head and transcript
+    /// rows (`fastPrefill`). Every part of a read starts with the same role,
+    /// codec prefix and reference transcript, so the next prompt reuses the
+    /// longest common prefix instead of prefilling it again.
+    private struct PromptPrefixKV {
+        let textIDs: [Int32]
+        let codecLanguageID: Int?
+        let speakerEmbedding: MLXArray?
+        let headRows: Int
+        let kv: [[MLXArray]]
+    }
+    private var cachedPromptPrefix: PromptPrefixKV?
     private var cachedPrimedDecoder: (codes: MLXArray, state: Qwen3TTSSpeechTokenizerDecoder.StreamingState)?
 
     public var sampleRate: Int { config.sampleRate }
@@ -513,8 +525,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let trailingTextHidden: MLXArray
         let ttsPadEmbed: MLXArray
         let refCodes: MLXArray?
+        var iclConditioning: Qwen3TTSReferenceConditioning?
 
         if let conditioning {
+            iclConditioning = conditioning
             let prepared = try prepareICLGenerationInputs(
                 text: text,
                 conditioning: conditioning
@@ -526,12 +540,10 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         } else if let refAudio,
            let refText,
            speechTokenizer.hasEncoder {
-            let prepared = try prepareICLGenerationInputs(
-                text: text,
-                refAudio: refAudio,
-                refText: refText,
-                language: language
-            )
+            let refConditioning = try prepareReferenceConditioning(
+                refAudio: refAudio, refText: refText, speakerEmbedding: nil, language: language)
+            iclConditioning = refConditioning
+            let prepared = try prepareICLGenerationInputs(text: text, conditioning: refConditioning)
             inputEmbedsInit = prepared.0
             trailingTextHidden = prepared.1
             ttsPadEmbed = prepared.2
@@ -594,6 +606,33 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
         var trailingIdx = 0
         var inputEmbeds = inputEmbedsInit
+        // Prompt prefix reuse (`fastPrefill`): restore the cached rows this
+        // prompt shares with the last one and prefill only the rest; a split
+        // prefill is bit-identical to one forward (QwenPrefillProbe).
+        var prefixToStore: PromptPrefixKV?
+        var prefixStoreRows = 0
+        if Self.fastPrefill, let c = iclConditioning {
+            let textIDs = c.referenceTextTokenIDs.asArray(Int32.self)
+            let headRows = Self.iclHeadRows(c)
+            if let cached = withInputPreparationCacheLock({ cachedPromptPrefix }),
+               cached.headRows == headRows, cached.codecLanguageID == c.codecLanguageID,
+               cached.speakerEmbedding === c.speakerEmbedding {
+                var common = 0
+                while common < min(cached.textIDs.count, textIDs.count),
+                      cached.textIDs[common] == textIDs[common] { common += 1 }
+                let reuse = headRows + common
+                if reuse < inputEmbeds.dim(1) {
+                    for (layerCache, kv) in zip(cache, cached.kv) {
+                        var lc = layerCache   // a class; `state` is a protocol setter
+                        lc.state = kv.map { $0[.ellipsis, ..<reuse, 0...] }
+                    }
+                    inputEmbeds = inputEmbeds[0..., reuse..., 0...]
+                }
+            }
+            prefixStoreRows = headRows + textIDs.count
+            prefixToStore = PromptPrefixKV(textIDs: textIDs, codecLanguageID: c.codecLanguageID,
+                                           speakerEmbedding: c.speakerEmbedding, headRows: headRows, kv: [])
+        }
         let eosTokenArray = MLXArray([Int32(eosTokenId)]).reshaped(1, 1)
         let codeCache = talker.codePredictor.makeCache()
 
@@ -671,6 +710,16 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             // Forward pass through talker
             let (logits, hidden) = talker(inputEmbeds, cache: cache)
             if Self.pipelineFrame { asyncEval(logits, hidden) }
+            if step == 0, let p = prefixToStore {
+                let kv = cache.map { layer in
+                    layer.state.map { contiguous($0[.ellipsis, ..<prefixStoreRows, 0...]) }
+                }
+                asyncEval(kv.flatMap { $0 })
+                let stored = PromptPrefixKV(textIDs: p.textIDs, codecLanguageID: p.codecLanguageID,
+                                            speakerEmbedding: p.speakerEmbedding, headRows: p.headRows, kv: kv)
+                withInputPreparationCacheLock { cachedPromptPrefix = stored }
+                prefixToStore = nil
+            }
             if profilingStart, step == 0 { eval(logits, hidden); markStart("prefill") }
             if profiling { eval(logits, hidden); Self.profileAdd("talker", Date().timeIntervalSince(stageStart)); stageStart = Date() }
 
@@ -953,10 +1002,15 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let lineTokens = tokenizer.encode(
             text: "<|im_start|>assistant\n\(text)<|im_end|>\n<|im_start|>assistant\n").count
         let line = max(0, lineTokens - 3 - 5)
-        let prefix = 3 + (conditioning.codecLanguageID == nil ? 3 : 4)
-            + (conditioning.speakerEmbedding == nil ? 0 : 1) + 2 - 1
+        let prefix = Self.iclHeadRows(conditioning)
         return prefix + conditioning.referenceTextTokenIDs.dim(1) + line + 1
             + 1 + conditioning.referenceSpeechCodes.dim(2)
+    }
+
+    /// Rows before the reference transcript in the ICL prompt: the role
+    /// (3) and the codec prefix (think/nothink, language, speaker, pad).
+    static func iclHeadRows(_ conditioning: Qwen3TTSReferenceConditioning) -> Int {
+        3 + (conditioning.codecLanguageID == nil ? 3 : 4) + (conditioning.speakerEmbedding == nil ? 0 : 1) + 2 - 1
     }
 
     /// The most frames a render of `text` may generate: `maxTokens`, capped

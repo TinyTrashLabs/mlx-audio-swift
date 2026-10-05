@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXAudioCore
+import MLXNN
 import XCTest
 
 @testable import MLXAudioTTS
@@ -151,6 +152,9 @@ final class QwenPrefillProbe: XCTestCase {
                         eval(next.referenceSpeechCodes, next.referenceTextTokenIDs)
                     }
                     let ks = Date().timeIntervalSince(t)
+                    // As in a read: the part before this one shared only the
+                    // reference transcript with it (the prompt-prefix cache).
+                    if name == "carried" { _ = try await take(model, Self.first, fresh, seed: 3, maxTokens: 1) }
                     Qwen3TTSModel.profileStart = true
                     _ = try await take(model, Self.second, c, seed: 11, maxTokens: 2)
                     Qwen3TTSModel.profileStart = false
@@ -170,6 +174,7 @@ final class QwenPrefillProbe: XCTestCase {
                 // to the first 1 s chunk of audio (12 frames).
                 var first = 0.0, audio = 0.0
                 for run in 0 ... Self.runs {
+                    if name == "carried" { _ = try await take(model, Self.first, fresh, seed: 3, maxTokens: 1) }
                     let tk = try await take(model, Self.second, c, seed: 11, maxTokens: 14)
                     if run > 0 { first += tk.firstToken; audio += tk.firstAudio }
                 }
@@ -193,6 +198,13 @@ final class QwenPrefillProbe: XCTestCase {
             let same = old.shape == new.shape && old.asArray(Int32.self) == new.asArray(Int32.self)
             print("[prefill-probe] parity \(name): \(old.dim(2)) frames, codes identical: \(same)")
             XCTAssertTrue(same, "\(name): codes differ between the module prefill and fastPrefill")
+            // Again: now the cached prefix covers this prompt's whole transcript
+            // context, and the decoder state may come from the snapshot.
+            let againTake = try await take(model, Self.second, c, seed: 23, maxTokens: 60)
+            let again = try XCTUnwrap(againTake.codes)
+            let sameAgain = again.shape == old.shape && again.asArray(Int32.self) == old.asArray(Int32.self)
+            print("[prefill-probe] parity \(name) (full prefix reuse): codes identical: \(sameAgain)")
+            XCTAssertTrue(sameAgain, "\(name): codes differ with the full cached prefix")
         }
     }
 
@@ -339,5 +351,38 @@ final class QwenPrefillProbe: XCTestCase {
             XCTAssertTrue(restoreSame, "\(name)")
         }
         dec.resetStreamingState()
+    }
+
+    /// Is a prefill split at a shared prefix bit-identical to one forward?
+    func testSplitPrefillExperiment() async throws {
+        let (model, fresh, carried) = try await conditionings()
+        let talker = model.talker
+        for (name, c) in [("fresh", fresh), ("carried", carried)] {
+            let embeds = try model.prepareICLGenerationInputs(text: Self.second, conditioning: c).0
+            let rows = embeds.dim(1)
+            let fullCache = talker.makeCache()
+            let (fullLogits, fullHidden) = talker(embeds, cache: fullCache)
+            eval(fullLogits, fullHidden)
+            for prefix in [67, 64, 128] {
+                let cache = talker.makeCache()
+                let (_, _) = talker(embeds[0..., ..<prefix, 0...], cache: cache)
+                let n = rows - prefix
+                let q = MLXArray(Int32(prefix) ..< Int32(rows)).reshaped(n, 1)
+                let k = MLXArray(Int32(0) ..< Int32(rows)).reshaped(1, rows)
+                let mask = ((k .> q).asType(.float32) * Float(-1e9)).asType(embeds.dtype)
+                let (logits, hidden) = talker(embeds[0..., prefix..., 0...], mask: mask, cache: cache)
+                eval(logits, hidden)
+                let hl = arrayEqual(hidden[0..., (-1)..., 0...], fullHidden[0..., (-1)..., 0...]).item(Bool.self)
+                let ll = arrayEqual(logits[0..., (-1)..., 0...], fullLogits[0..., (-1)..., 0...]).item(Bool.self)
+                let d = abs(hidden[0..., (-1)..., 0...].asType(.float32) - fullHidden[0..., (-1)..., 0...].asType(.float32)).max().item(Float.self)
+                let kvSame = zip(cache, fullCache).allSatisfy { a, b in
+                    zip(a.state, b.state).allSatisfy { arrayEqual($0, $1).item(Bool.self) } }
+                print("[prefill-probe] split \(name) rows \(rows) at \(prefix): last hidden same \(hl) (max \(d)), "
+                      + "logits same \(ll), kv same \(kvSame), dtype \(embeds.dtype) mask \(MultiHeadAttention.createAdditiveCausalMask(3).asType(embeds.dtype))")
+            }
+            // Codec head on the last row only.
+            let lastOnly = talker.codecHead(fullHidden[0..., (-1)..., 0...])
+            print("[prefill-probe] last-row head \(name): same \(arrayEqual(lastOnly, fullLogits[0..., (-1)..., 0...]).item(Bool.self))")
+        }
     }
 }

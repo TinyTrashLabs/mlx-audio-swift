@@ -322,7 +322,17 @@ final class Qwen3TTSTalkerModel: Module {
 
         var causalMask = mask
         if causalMask == nil, seqLen > 1 {
-            causalMask = MultiHeadAttention.createAdditiveCausalMask(seqLen).asType(inputsEmbeds.dtype)
+            if offset == 0 {
+                causalMask = MultiHeadAttention.createAdditiveCausalMask(seqLen).asType(inputsEmbeds.dtype)
+            } else {
+                // A prefill after cached rows (`fastPrefill`'s prompt prefix):
+                // row i sees keys 0 ... offset + i. Built like
+                // createAdditiveCausalMask, so each row matches the row the
+                // single-forward mask has for that position.
+                let rows = MLXArray(Int32(offset) ..< Int32(offset + seqLen)).reshaped(seqLen, 1)
+                let keys = MLXArray(Int32(0) ..< Int32(offset + seqLen)).reshaped(1, offset + seqLen)
+                causalMask = ((rows .< keys).asType(.float32) * -1e9).asType(inputsEmbeds.dtype)
+            }
         }
 
         var x = inputsEmbeds
