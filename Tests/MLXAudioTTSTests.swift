@@ -1333,6 +1333,78 @@ struct EchoTTSTests {
     }
 }
 
+/// Fake tokenizer whose semantic ids sit inside the tiny model's vocabulary.
+private struct TinyStreamFishTokenizer: FishSpeechTokenizing {
+    let vocabSize = 128
+    let eosTokenID = 99
+    let padTokenID = 0
+    let semanticBeginID = 20
+    let semanticEndID = 51
+
+    func encode(_ text: String, addSpecialTokens: Bool) -> [Int] {
+        if text.hasPrefix("<|") { return [11] }
+        return text.utf8.map { Int($0) % 70 + 52 }
+    }
+    func decode(_ tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func tokenID(for token: String) -> Int? {
+        token == fishSpeechIMEndToken ? 12 : (token == fishSpeechPadToken ? 0 : nil)
+    }
+}
+
+/// Tiny Fish model + a real-geometry (2048 samples/frame) tiny codec, random weights.
+private func makeTinyStreamingFishModel() -> FishSpeechModel {
+    var config = makeTinyFishSpeechConfig()
+    config.semanticStartTokenID = 20
+    config.semanticEndTokenID = 51
+    config.maxFramesPerTextToken = 12
+    config.textConfig.maxSeqLen = 1_024
+    let model = FishSpeechModel(config: config)
+    model.tokenizer = TinyStreamFishTokenizer()
+    model.imEndTokenID = 12
+    var bias = Array(repeating: Float(-1e9), count: 128)
+    for index in 20 ... 51 { bias[index] = 0 }   // never emit im_end: always run to budget
+    model.semanticLogitBias = MLXArray(bias).reshaped([1, 128])
+
+    let args = FishS1DACModelArgs(
+        blockSize: 4096, nLayer: 2, nHead: 2, dim: 16, intermediateSize: 32, headDim: 8,
+        channelsFirst: true)
+    let quantizer = FishS1DownsampleResidualVectorQuantize(
+        inputDim: 16, nCodebooks: 1, codebookDim: 4, codebookSize: 32,
+        semanticCodebookSize: 32, downsampleFactor: [2, 2],
+        preModule: FishS1Identity(),
+        postModule: FishS1WindowLimitedTransformer(
+            config: args, inputDim: 16, windowSize: 4, causal: true))
+    let codec = FishS1DAC(
+        encoderDim: 4, encoderRates: [2, 4, 8, 8], latentDim: 16, decoderDim: 16,
+        decoderRates: [8, 8, 4, 2], quantizer: quantizer, sampleRate: 44_100, causal: true,
+        encoderTransformerLayers: [0, 0, 0, 0], decoderTransformerLayers: [0, 0, 0, 0],
+        transformerConfigFactory: nil)
+    for stage in quantizer.upsample { stage.block.gamma = MLXArray.ones([16]) }
+    model.codec = codec
+    eval(model, codec)
+    return model
+}
+
+private func fishTestParams() -> GenerateParameters {
+    GenerateParameters(maxTokens: 40, temperature: 1.0, topP: 1.0)
+}
+
+private func collectFishStream(
+    _ stream: AsyncThrowingStream<AudioGeneration, Error>
+) async throws -> (chunks: [MLXArray], infoCount: Int) {
+    var chunks: [MLXArray] = []
+    var infos = 0
+    for try await event in stream {
+        switch event {
+        case .audio(let audio): chunks.append(audio)
+        case .info: infos += 1
+        case .token: break
+        }
+    }
+    return (chunks, infos)
+}
+
+@Suite(.serialized)
 struct FishSpeechTests {
 
     @Test func testConfigDecodesQuantizationAlias() throws {
@@ -1538,6 +1610,94 @@ struct FishSpeechTests {
         }
         #expect(seen.isSubset(of: top5))
         #expect(seen.count > 1)
+    }
+
+    @Test func testFishStreamChunksConcatenateToFullRender() async throws {
+        MLXRandom.seed(3)
+        let model = makeTinyStreamingFishModel()
+        let ref = MLXRandom.normal([44_100]) * 0.1
+        let refCodes = try model.encodeReference(ref)
+        let text = "hello streaming world, this is a long enough line"
+
+        MLXRandom.seed(7)
+        let full = try await model.generate(
+            text: text, refCodes: refCodes, refText: "ref", generationParameters: fishTestParams())
+
+        MLXRandom.seed(7)
+        let (chunks, infos) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: refCodes, refText: "ref",
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(full.dim(0) >= 20 * 2048)
+        // The reported generated-frame count times the hop is exactly the output length.
+        MLXRandom.seed(7)
+        var generatedFrames = 0
+        for try await event in model.generateStream(
+            text: text, refCodes: refCodes, refText: "ref",
+            generationParameters: fishTestParams(), streamingInterval: 0.5)
+        {
+            if case .info(let info) = event { generatedFrames = info.generationTokenCount }
+        }
+        #expect(full.dim(0) == generatedFrames * 2048)
+        // Primed one-shot crop is exact: output is only the generated frames (no reference audio).
+        #expect(model.leftContextFrames > 0 && refCodes.dim(1) >= model.leftContextFrames)
+        #expect(chunks.count > 1)
+        #expect(infos == 1)
+        let joined = concatenated(chunks, axis: 0)
+        #expect(joined.shape == full.shape)
+        #expect(allClose(joined, full, atol: 1e-4).item(Bool.self))
+
+        // With no reference there is nothing to prime from; chunks must still join exactly.
+        MLXRandom.seed(7)
+        let bare = try await model.generate(
+            text: text, refCodes: nil, refText: nil, generationParameters: fishTestParams())
+        MLXRandom.seed(7)
+        let (bareChunks, _) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: nil, refText: nil,
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(bareChunks.count > 1)
+        #expect(allClose(concatenated(bareChunks, axis: 0), bare, atol: 1e-4).item(Bool.self))
+
+        // Context shorter than the receptive field must break the join (else the check is vacuous).
+        model.leftContextFramesOverride = 0
+        MLXRandom.seed(7)
+        let (cold, _) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: nil, refText: nil,
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(!allClose(concatenated(cold, axis: 0), bare, atol: 1e-4).item(Bool.self))
+    }
+
+    @Test func testFishRefCodesPathMatchesRefAudioPath() async throws {
+        MLXRandom.seed(3)
+        let model = makeTinyStreamingFishModel()
+        let ref = MLXRandom.normal([44_100]) * 0.1
+        let refCodes = try model.encodeReference(ref)
+        #expect(refCodes.ndim == 2)
+        #expect(refCodes.dim(0) == 2)
+        #expect(refCodes.dtype == .int32)
+        let text = "hello streaming world, this is a long enough line"
+
+        MLXRandom.seed(7)
+        let fromAudio = try await model.generate(
+            text: text, voice: nil, refAudio: ref, refText: "ref", language: nil,
+            generationParameters: fishTestParams())
+        MLXRandom.seed(7)
+        let fromCodes = try await model.generate(
+            text: text, refCodes: refCodes, refText: "ref", generationParameters: fishTestParams())
+        #expect(fromAudio.shape == fromCodes.shape)
+        #expect(allClose(fromAudio, fromCodes, atol: 1e-5).item(Bool.self))
+
+        MLXRandom.seed(7)
+        let (audioChunks, _) = try await collectFishStream(model.generateStream(
+            text: text, voice: nil, refAudio: ref, refText: "ref", language: nil,
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        MLXRandom.seed(7)
+        let (codeChunks, _) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: refCodes, refText: "ref",
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(audioChunks.count == codeChunks.count)
+        #expect(allClose(
+            concatenated(audioChunks, axis: 0), concatenated(codeChunks, axis: 0), atol: 1e-5
+        ).item(Bool.self))
     }
 
     @Test func testDefaultRepositoryID() {

@@ -506,7 +506,7 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
 
     @ModuleInfo(key: "model") var model: FishSpeechDualARTransformer
 
-    var tokenizer: FishSpeechTokenizer?
+    var tokenizer: (any FishSpeechTokenizing)?
     var codec: FishS1DAC?
     var semanticLogitBias: MLXArray?
     /// `<|im_end|>` id; resolved from the tokenizer when loaded (tests may set it directly).
@@ -563,9 +563,26 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         _ = voice
         _ = language
 
+        let refCodes = try refAudio.map { try encodeReference($0) }
+        return try await generate(
+            text: text,
+            refCodes: refCodes,
+            refText: refText,
+            generationParameters: generationParameters
+        )
+    }
+
+    /// Generates from precomputed reference codes (`[numCodebooks, T]`, int32, as
+    /// ``encodeReference(_:)`` returns) so callers can cache them per voice.
+    public func generate(
+        text: String,
+        refCodes: MLXArray?,
+        refText: String?,
+        generationParameters: GenerateParameters
+    ) async throws -> MLXArray {
         let segments = try generateSegments(
             text: text,
-            refAudio: refAudio,
+            refCodes: refCodes,
             refText: refText,
             maxTokens: generationParameters.maxTokens ?? 1_024,
             temperature: generationParameters.temperature,
@@ -576,6 +593,19 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         )
         try Task.checkCancellation()
         return concatenateAudioSegments(segments)
+    }
+
+    /// Encodes reference audio to the codes the generate paths feed the model: the same
+    /// channel/shape preparation and codec encode, trimmed to the real frame count.
+    /// Returns `[numCodebooks, T]` (int32).
+    public func encodeReference(_ refAudio: MLXArray) throws -> MLXArray {
+        guard let codec else {
+            throw AudioGenerationError.modelNotInitialized("Codec not loaded")
+        }
+        let audio = prepareReferencePromptAudio(refAudio)
+        let (indices, featureLengths) = codec.encode(audio)
+        let promptLength = Int(featureLengths.item(Int32.self))
+        return indices[0, 0..., 0..<promptLength].asType(.int32)
     }
 
     public func generateStream(
@@ -608,8 +638,46 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
     ) -> AsyncThrowingStream<AudioGeneration, Error> {
         _ = voice
         _ = language
-        _ = streamingInterval
+        return streamGeneration(
+            text: text,
+            reference: .audio(refAudio),
+            refText: refText,
+            generationParameters: generationParameters,
+            streamingInterval: streamingInterval
+        )
+    }
 
+    /// Streams from precomputed reference codes; see ``generate(text:refCodes:refText:generationParameters:)``.
+    public func generateStream(
+        text: String,
+        refCodes: MLXArray?,
+        refText: String?,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double = 2.0
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        streamGeneration(
+            text: text,
+            reference: .codes(refCodes),
+            refText: refText,
+            generationParameters: generationParameters,
+            streamingInterval: streamingInterval
+        )
+    }
+
+    private enum StreamReference: @unchecked Sendable {
+        case audio(MLXArray?)
+        case codes(MLXArray?)
+    }
+
+    /// Yields `.audio` chunks of about `streamingInterval` seconds while frames are generated
+    /// (every batch of a long text, in order), then one `.info`.
+    private func streamGeneration(
+        text: String,
+        reference: StreamReference,
+        refText: String?,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
         let (stream, continuation) = AsyncThrowingStream<AudioGeneration, Error>.makeStream()
         let task = Task { @Sendable [weak self] in
             guard let self else {
@@ -618,19 +686,27 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
             }
 
             do {
+                let refCodes: MLXArray?
+                switch reference {
+                case .audio(let audio): refCodes = try audio.map { try self.encodeReference($0) }
+                case .codes(let codes): refCodes = codes
+                }
                 let segments = try self.generateSegments(
                     text: text,
-                    refAudio: refAudio,
+                    refCodes: refCodes,
                     refText: refText,
                     maxTokens: generationParameters.maxTokens ?? 1_024,
                     temperature: generationParameters.temperature,
                     topP: generationParameters.topP,
                     topK: 30,
                     speed: 1.0,
-                    chunkLength: 300
+                    chunkLength: 300,
+                    streaming: FishStreamingSink(
+                        intervalSeconds: streamingInterval,
+                        yield: { continuation.yield(.audio($0)) }
+                    )
                 )
                 try Task.checkCancellation()
-                let audio = self.concatenateAudioSegments(segments)
                 let totalPromptTokens = segments.reduce(into: 0) { $0 += $1.promptTokenCount }
                 let totalGenerationTokens = segments.reduce(into: 0) { $0 += $1.generationTokenCount }
                 let totalTime = segments.reduce(0.0) { $0 + $1.elapsed }
@@ -644,7 +720,6 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                     tokensPerSecond: totalTime > 0 ? Double(totalGenerationTokens) / totalTime : 0,
                     peakMemoryUsage: peakMemory
                 )))
-                continuation.yield(.audio(audio))
                 continuation.finish()
             } catch {
                 continuation.finish(throwing: error)
@@ -818,7 +893,8 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         topK: Int,
         temperature: Float,
         refFrames: Int? = nil,
-        refTextTokenCount: Int? = nil
+        refTextTokenCount: Int? = nil,
+        onFrame: (([[Int32]]) throws -> Void)? = nil
     ) throws -> MLXArray {
         guard let tokenizer else {
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
@@ -914,6 +990,7 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
             // One GPU sync per frame: the codebooks and the next slow step share a graph.
             eval(previousCodebooks, result.logits, result.hiddenStates)
             generatedSteps.append(previousCodebooks.asArray(Int32.self))
+            try onFrame?(generatedSteps)
             logits = result.logits[0..., (result.logits.dim(1) - 1)..<result.logits.dim(1), 0...]
                 .squeezed(axis: 1)
             hiddenState = result.hiddenStates[0..., (result.hiddenStates.dim(1) - 1)..<result.hiddenStates.dim(1), 0...]
@@ -941,27 +1018,55 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         return MLXArray(rows.flatMap { $0 }).reshaped([model.numCodebooks, generatedSteps.count])
     }
 
-    private func decodeCodes(_ codes: MLXArray) throws -> MLXArray {
+    /// Cap on decoder context per chunk. The exact receptive field is 1029 frames (Audio8), too
+    /// costly per chunk. Measured on Benson: 320 -> max diff 1.6e-3 overall (7.3e-4 at joins),
+    /// 384 -> 8.5e-4 overall (2.1e-4 at joins), 256 -> 6.7e-3; 384 is the smallest under 1e-3 everywhere.
+    static let streamingLeftContextCap = 384
+
+    /// Earlier frames of context each decode gets: the codec's causal receptive field, capped at
+    /// `streamingLeftContextCap`. Tests may override it.
+    var leftContextFrames: Int {
+        if let leftContextFramesOverride { return leftContextFramesOverride }
+        return min(codec?.decoderReceptiveFieldFrames ?? 0, Self.streamingLeftContextCap)
+    }
+    var leftContextFramesOverride: Int?
+
+    /// One-shot decode of a batch's codes. The tail of the reference codes (`primer`) runs through
+    /// the decoder first so the opening word comes from the voice's own decoder state, not a cold
+    /// start; its samples are dropped. Streaming decodes the same way, chunk by chunk.
+    private func decodeCodes(_ codes: MLXArray, primer: MLXArray?) throws -> MLXArray {
         guard let codec else {
             throw AudioGenerationError.modelNotInitialized("Codec not loaded")
         }
 
-        let featureLengths = MLXArray([Int32(codes.dim(1))])
-        let (audio, audioLengths) = codec.decode(codes.expandedDimensions(axis: 0), featureLengths: featureLengths)
-        let length = Int(audioLengths.item(Int32.self))
-        return audio[0, 0, 0..<length]
+        let frames = codes.dim(1)
+        let tail = primerTail(primer)
+        let all = tail.map { concatenated([$0, codes], axis: 1) } ?? codes
+        return codec.decodeIncremental(
+            all.expandedDimensions(axis: 0),
+            leftContextFrames: tail?.dim(1) ?? 0,
+            newFrames: frames
+        )
+    }
+
+    private func primerTail(_ primer: MLXArray?) -> MLXArray? {
+        guard let primer, primer.dim(1) > 0 else { return nil }
+        let keep = min(leftContextFrames, primer.dim(1))
+        guard keep > 0 else { return nil }
+        return primer[0..., (primer.dim(1) - keep)...]
     }
 
     private func generateSegments(
         text: String,
-        refAudio: MLXArray?,
+        refCodes: MLXArray?,
         refText: String?,
         maxTokens: Int,
         temperature: Float,
         topP: Float,
         topK: Int,
         speed: Float,
-        chunkLength: Int
+        chunkLength: Int,
+        streaming: FishStreamingSink? = nil
     ) throws -> [FishSpeechGeneratedSegment] {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AudioGenerationError.invalidInput("Text prompt cannot be empty")
@@ -977,13 +1082,10 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         var promptTexts: [String] = []
         var refFrames: Int?
         var refTextTokenCount: Int?
-        if let refAudio {
-            let audio = prepareReferencePromptAudio(refAudio)
-            let (indices, featureLengths) = codec.encode(audio)
-            let promptLength = Int(featureLengths.item(Int32.self))
-            promptTokens.append(indices[0, 0..., 0..<promptLength])
+        if let refCodes {
+            promptTokens.append(refCodes)
             promptTexts.append(refText ?? "")
-            refFrames = promptLength
+            refFrames = refCodes.dim(1)
             if let refText, !refText.isEmpty {
                 refTextTokenCount = tokenizer.encode(refText, addSpecialTokens: false).count
             }
@@ -999,6 +1101,12 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         var segments: [FishSpeechGeneratedSegment] = []
         segments.reserveCapacity(batches.count)
 
+        let chunkFrames = streaming.map {
+            max(1, Int((($0.intervalSeconds * Double(codec.sampleRate)) / Double(codec.frameLength)).rounded()))
+        }
+        let context = leftContextFrames
+        let primer = primerTail(refCodes)
+
         for batchText in batches {
             try Task.checkCancellation()
             conversation.append(FishSpeechMessage(
@@ -1010,6 +1118,43 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
             ))
 
             let startTime = CFAbsoluteTimeGetCurrent()
+            var emitted = 0
+            let numCodebooks = model.numCodebooks
+
+            // Decodes frames [emitted, end) with up to `context` earlier frames (generated ones,
+            // then the reference tail) in front, and hands the new samples to the stream.
+            func emitChunk(steps: [[Int32]], end: Int) throws {
+                guard let streaming, end > emitted else { return }
+                let contextStart = max(0, emitted - context)
+
+                var primerFrames = 0
+                if let primer, emitted - contextStart < context {
+                    primerFrames = min(primer.dim(1), context - (emitted - contextStart))
+                }
+                let generatedCount = end - contextStart
+                var rows = [Int32](repeating: 0, count: numCodebooks * generatedCount)
+                for column in 0 ..< generatedCount {
+                    let step = steps[contextStart + column]
+                    for row in 0 ..< min(numCodebooks, step.count) {
+                        rows[row * generatedCount + column] = step[row]
+                    }
+                }
+
+                var window = MLXArray(rows).reshaped([numCodebooks, generatedCount])
+                if let primer, primerFrames > 0 {
+                    window = concatenated([primer[0..., (primer.dim(1) - primerFrames)...], window], axis: 1)
+                }
+                let audio = codec.decodeIncremental(
+                    window.expandedDimensions(axis: 0),
+                    leftContextFrames: primerFrames + (emitted - contextStart),
+                    newFrames: end - emitted
+                )
+                eval(audio)
+                try Task.checkCancellation()
+                streaming.yield(audio)
+                emitted = end
+            }
+
             let codes = try generateCodesForBatch(
                 conversation: conversation,
                 batchText: batchText,
@@ -1018,14 +1163,33 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                 topK: topK,
                 temperature: temperature,
                 refFrames: refFrames,
-                refTextTokenCount: refTextTokenCount
+                refTextTokenCount: refTextTokenCount,
+                onFrame: chunkFrames.map { chunkFrames in
+                    { steps in
+                        if steps.count - emitted >= chunkFrames {
+                            try emitChunk(steps: steps, end: steps.count)
+                        }
+                    }
+                }
             )
             try Task.checkCancellation()
-            var audio = try decodeCodes(codes)
-            if abs(speed - 1.0) > 1e-6 {
-                audio = fishSpeechAdjustSpeed(audio, speed: speed)
+
+            var audio = MLXArray.zeros([0], dtype: .float32)
+            if streaming != nil {
+                // Final partial chunk; the rest already went out while generating.
+                if emitted < codes.dim(1) {
+                    let steps = (0 ..< codes.dim(1)).map { column in
+                        (0 ..< numCodebooks).map { codes[$0, column].item(Int32.self) }
+                    }
+                    try emitChunk(steps: steps, end: codes.dim(1))
+                }
+            } else {
+                audio = try decodeCodes(codes, primer: refCodes)
+                if abs(speed - 1.0) > 1e-6 {
+                    audio = fishSpeechAdjustSpeed(audio, speed: speed)
+                }
+                eval(audio)
             }
-            eval(audio)
 
             conversation.append(FishSpeechMessage(
                 role: .assistant,
@@ -1116,4 +1280,10 @@ func fishSpeechFramesPerTextToken(
         return configMax
     }
     return min(configMax, Double(refFrames) / Double(refTextTokenCount) * referenceScale)
+}
+
+/// Where streamed audio goes: chunks of about `intervalSeconds`, in order.
+struct FishStreamingSink {
+    let intervalSeconds: Double
+    let yield: (MLXArray) -> Void
 }
