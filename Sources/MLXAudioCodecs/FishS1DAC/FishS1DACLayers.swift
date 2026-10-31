@@ -156,6 +156,32 @@ public final class FishS1ConvTranspose1dTorch: Module, UnaryLayer {
         self.bias = bias ? MLXArray.zeros([outChannels]) : nil
     }
 
+    /// Polyphase form of the stride-`s`, kernel-`2s` transposed conv (nil when it does not apply):
+    /// a kernel-2 conv giving `s * outChannels` channels that interleave into the upsampled signal.
+    /// MLX runs a transposed conv as a conv over a zero-stuffed input, `s` times the work and
+    /// workspace of this. Built once, after the weight is final (`preparePolyphase`).
+    private(set) var _polyWeight: MLXArray?
+
+    func preparePolyphase() {
+        guard kernelSize == 2 * stride, stride > 1, groups == 1, dilation == 1, padding == 0 else { return }
+        let inCh = weight.dim(0), outCh = weight.dim(1)
+        let w4 = weight.reshaped([inCh, outCh, 2, stride]) // kernel index = j * stride + r
+        let flipped = concatenated([w4[0..., 0..., 1 ..< 2, 0...], w4[0..., 0..., 0 ..< 1, 0...]], axis: 2)
+        let poly = flipped.transposed(3, 1, 2, 0).reshaped([stride * outCh, 2, inCh])
+        eval(poly)
+        _polyWeight = poly
+    }
+
+    /// First `L * stride` samples of the transposed conv (the causal layer trims the rest), or nil.
+    func polyphaseForward(_ x: MLXArray) -> MLXArray? {
+        guard let poly = _polyWeight else { return nil }
+        let xNLC = padded(x.transposed(0, 2, 1), widths: [IntOrPair(0), IntOrPair((1, 0)), IntOrPair(0)])
+        var y = MLX.conv1d(xNLC, poly) // [B, L, stride * outCh]
+        y = y.reshaped([y.dim(0), y.dim(1) * stride, y.dim(2) / stride])
+        if let bias { y = y + bias }
+        return y.transposed(0, 2, 1)
+    }
+
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let xNLC = x.transposed(0, 2, 1)
         var y = MLX.convTransposed1d(
@@ -184,9 +210,10 @@ public final class FishS1WNConv1d: Module, UnaryLayer {
     public var weight_g: MLXArray
     public var weight_v: MLXArray
     public var bias: MLXArray?
-    var _foldedWeight: MLXArray?
+    private var _foldedWeight: MLXArray? // underscore: not a module parameter
 
     /// Replaces `weight_g`/`weight_v` with the single folded weight (see `fishS1FoldedWeight`).
+    /// Irreversible: the raw weight-norm parameters are dropped.
     public func foldWeightNorm() {
         guard _foldedWeight == nil else { return }
         let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
@@ -253,9 +280,10 @@ public final class FishS1WNConvTranspose1d: Module, UnaryLayer {
     public var weight_g: MLXArray
     public var weight_v: MLXArray
     public var bias: MLXArray?
-    var _foldedWeight: MLXArray?
+    private var _foldedWeight: MLXArray? // underscore: not a module parameter
 
     /// Replaces `weight_g`/`weight_v` with the single folded weight (see `fishS1FoldedWeight`).
+    /// Irreversible: the raw weight-norm parameters are dropped.
     public func foldWeightNorm() {
         guard _foldedWeight == nil else { return }
         let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
@@ -400,6 +428,7 @@ public final class FishS1CausalTransConvNet: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if kernelSize == 2 * stride, let fast = conv.polyphaseForward(x) { return fast }
         let y = conv(x)
         let totalPad = kernelSize - stride
         let right = Int(ceil(Double(totalPad)))
@@ -418,6 +447,7 @@ public final class FishS1CausalWNConv1d: Module, UnaryLayer {
     var _folded = false
 
     /// Folds weight norm into the inner conv's weight once and drops `weight_g`/`weight_v`.
+    /// Irreversible.
     public func foldWeightNorm() {
         guard !_folded else { return }
         let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
@@ -476,6 +506,7 @@ public final class FishS1CausalWNConvTranspose1d: Module, UnaryLayer {
     var _folded = false
 
     /// Folds weight norm into the inner conv's weight once and drops `weight_g`/`weight_v`.
+    /// Irreversible.
     public func foldWeightNorm() {
         guard !_folded else { return }
         let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
@@ -484,6 +515,7 @@ public final class FishS1CausalWNConvTranspose1d: Module, UnaryLayer {
         conv.conv.bias = bias
         weight_g = fishS1FoldedPlaceholder()
         weight_v = fishS1FoldedPlaceholder()
+        conv.conv.preparePolyphase()
         _folded = true
     }
 

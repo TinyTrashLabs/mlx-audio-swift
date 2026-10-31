@@ -483,9 +483,13 @@ public final class FishS1DAC: Module {
         // front: the stages are causal, so this is exact) and bounds the memory peak.
         let zFrames = z.dim(2)
         var pieces: [MLXArray] = []
+        // Equal-sized passes: the fewest that stay under the cap, so the margin is recomputed
+        // as rarely as possible.
+        let passCount = (new + Self.maxNewFramesPerPass - 1) / Self.maxNewFramesPerPass
+        let passFrames = (new + passCount - 1) / passCount
         var start = zFrames - new
         while start < zFrames {
-            let end = min(start + Self.maxNewFramesPerPass, zFrames)
+            let end = min(start + passFrames, zFrames)
             let from = max(0, start - convReceptiveFieldFrames)
             var piece = z[0..., 0..., from..<end]
             for stage in quantizer.upsample {
@@ -502,10 +506,10 @@ public final class FishS1DAC: Module {
     }
 
     /// Most new frames the conv stages decode in one pass (see `decodeIncremental`).
-    static let maxNewFramesPerPass = 32
+    static let maxNewFramesPerPass = 48
 
     /// Folds every weight-normed conv once (weight = g * v / |v|) so encode/decode stop recomputing
-    /// each layer's weight, and the raw g/v stop taking memory.
+    /// each layer's weight, and the raw g/v stop taking memory. Irreversible: call it once the weights are loaded.
     public func foldWeightNorm() {
         for (_, module) in namedModules() {
             switch module {

@@ -33,6 +33,7 @@
 
 import Testing
 import MLX
+import MLXNN
 import Foundation
 
 @testable import MLXAudioCore
@@ -1028,8 +1029,45 @@ struct FishS1DACTests {
         model.foldWeightNorm()
         model.foldWeightNorm() // idempotent
         let after = model.decode(codes, featureLengths: lengths).0
-        #expect(allClose(before, after, atol: 1e-5).item(Bool.self))
+        let n = min(before.dim(2), after.dim(2))
+        #expect(before.dim(2) == after.dim(2))
+        // The polyphase transposed conv sums in a different order (GPU conv), so ~1e-4, not bit-equal.
+        #expect(allClose(before[0..., 0..., 0 ..< n], after[0..., 0..., 0 ..< n], atol: 5e-4).item(Bool.self))
         #expect(allClose(codesBefore, model.encode(wave).0).item(Bool.self))
+    }
+
+    /// Non-causal weight-normed convs fold to the same output, and the folded weight is not a parameter.
+    @Test func testFishS1NonCausalWNFoldKeepsOutput() {
+        MLXRandom.seed(7)
+        let conv = FishS1WNConv1d(inChannels: 4, outChannels: 6, kernelSize: 3, padding: 1)
+        let up = FishS1WNConvTranspose1d(inChannels: 6, outChannels: 4, kernelSize: 4, stride: 2, padding: 1)
+        let x = MLXRandom.normal([1, 4, 17])
+        let convBefore = conv(x)
+        let upBefore = up(convBefore)
+        conv.foldWeightNorm()
+        conv.foldWeightNorm() // idempotent
+        up.foldWeightNorm()
+        #expect(allClose(conv(x), convBefore, atol: 1e-5).item(Bool.self))
+        #expect(allClose(up(conv(x)), upBefore, atol: 1e-5).item(Bool.self))
+        let keys = Set(conv.parameters().flattened().map(\.0) + up.parameters().flattened().map(\.0))
+        #expect(!keys.contains { $0.contains("folded") })
+    }
+
+    @Test func testFishS1PolyphaseTransposedConvMatchesDirect() {
+        MLXRandom.seed(8)
+        for stride in [2, 4, 8] {
+            let layer = FishS1CausalWNConvTranspose1d(
+                inChannels: 6, outChannels: 5, kernelSize: 2 * stride, stride: stride)
+            layer.bias = MLXRandom.normal([5])
+            let x = MLXRandom.normal([1, 6, 9])
+            let direct = layer(x)
+            layer.foldWeightNorm()
+            let fast = layer(x)
+            #expect(fast.dim(2) == 9 * stride)
+            #expect(direct.dim(2) >= fast.dim(2))
+            let diff = abs(direct[0..., 0..., 0 ..< fast.dim(2)] - fast).max().item(Float.self)
+            #expect(diff < 1e-5, "stride \(stride) diff \(diff)")
+        }
     }
 
     @Test func testTinyEncodeDecode() throws {
