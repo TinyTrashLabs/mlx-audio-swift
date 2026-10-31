@@ -400,7 +400,7 @@ private func fishSpeechAdjustSpeed(_ audio: MLXArray, speed: Float) -> MLXArray 
     return leftWeight * audio[left] + rightWeight * audio[right]
 }
 
-private func fishSpeechSampleToken(
+func fishSpeechSampleToken(
     logits: MLXArray,
     temperature: Float,
     topP: Float,
@@ -427,6 +427,25 @@ private func fishSpeechSampleToken(
         effectiveTopK = vocabSize
     } else {
         effectiveTopK = topK
+    }
+
+    // Top-k first with a partial sort, then top-p over just those k candidates (a full argSort of
+    // the vocabulary per draw dominated frame time). The first candidate is always kept.
+    if effectiveTopK < vocabSize {
+        let candidates = argPartition(-logits, kth: effectiveTopK - 1, axis: -1)[
+            .ellipsis, 0 ..< effectiveTopK
+        ]
+        let candidateLogits = takeAlong(logits, candidates, axis: -1)
+        let order = argSort(-candidateLogits, axis: -1)
+        let sorted = takeAlong(candidateLogits, order, axis: -1).asType(.float32)
+        let probs = softmax(sorted, axis: -1)
+        let shifted = cumsum(probs, axis: -1) - probs
+        let kept = MLX.where(shifted .> MLXArray(topP), MLXArray(-Float.infinity), sorted)
+        let probabilities = softmax(kept * (1.0 / max(temperature, 1e-5)), axis: -1)
+        let noise = -log(MLXRandom.uniform(low: 1e-6, high: 1.0, probabilities.shape))
+        let pick = argMax(probabilities / noise, axis: -1, keepDims: true)
+        let original = takeAlong(takeAlong(candidates, order, axis: -1), pick, axis: -1)
+        return original.squeezed(axis: -1).asType(.int32)
     }
 
     let sortedIndices = argSort(-logits, axis: -1)
@@ -490,6 +509,8 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
     var tokenizer: FishSpeechTokenizer?
     var codec: FishS1DAC?
     var semanticLogitBias: MLXArray?
+    /// `<|im_end|>` id; resolved from the tokenizer when loaded (tests may set it directly).
+    var imEndTokenID: Int?
 
     public var sampleRate: Int {
         config.sampleRate
@@ -649,6 +670,7 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         }
 
         let imEndID = tokenizer.tokenID(for: fishSpeechIMEndToken) ?? 0
+        self.imEndTokenID = imEndID
         let vocabSize = max(
             config.textConfig.vocabSize,
             tokenizer.vocabSize,
@@ -737,30 +759,46 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         }
     }
 
-    private func sampleSemantic(
+    func sampleSemantic(
         logits: MLXArray,
         previousSemanticTokens: [Int],
         topP: Float,
         topK: Int,
         temperature: Float
     ) throws -> MLXArray {
-        guard let semanticLogitBias else {
+        guard semanticLogitBias != nil else {
             throw AudioGenerationError.modelNotInitialized("Semantic logit bias not initialized")
         }
 
-        let biasedLogits = logits + semanticLogitBias.asType(logits.dtype)
-        let normal = fishSpeechSampleToken(
-            logits: biasedLogits,
+        // The bias only allows the semantic range plus <|im_end|>; sample over that narrow slice
+        // instead of sorting the whole text vocabulary (twice, for RAS) every frame.
+        let start = config.semanticStartTokenID
+        let end = min(config.semanticEndTokenID, logits.dim(-1) - 1)
+        let imEndID = imEndTokenID ?? tokenizer?.tokenID(for: fishSpeechIMEndToken) ?? config.eosTokenID
+        let semanticWidth = end - start + 1
+        let window = concatenated(
+            [logits[0..., start ... end], logits[0..., imEndID ..< (imEndID + 1)]],
+            axis: -1
+        )
+        func toTokenID(_ local: MLXArray) -> MLXArray {
+            MLX.where(
+                local .< MLXArray(Int32(semanticWidth)),
+                local + Int32(start),
+                MLXArray(Int32(imEndID))
+            ).asType(.int32)
+        }
+        let normal = toTokenID(fishSpeechSampleToken(
+            logits: window,
             temperature: temperature,
             topP: topP,
             topK: topK
-        )
-        let highTemperature = fishSpeechSampleToken(
-            logits: biasedLogits,
+        ))
+        let highTemperature = toTokenID(fishSpeechSampleToken(
+            logits: window,
             temperature: fishSpeechRASHighTemperature,
             topP: fishSpeechRASHighTopP,
             topK: topK
-        )
+        ))
         eval(normal, highTemperature)
 
         let tokenValue = Int(normal.item(Int32.self))
@@ -841,8 +879,7 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
 
             var previousCodebooks = semanticCode.reshaped([1, 1])
             let fastCache = model.makeFastCache()
-            let fastPrefill = model.fastForwardCached(hiddenState, cache: fastCache)
-            eval(fastPrefill)
+            _ = model.fastForwardCached(hiddenState, cache: fastCache)
             var fastHidden = model.fastEmbeddings(semanticCode)
 
             for _ in 0 ..< (model.numCodebooks - 1) {
@@ -853,7 +890,6 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                     topP: topP,
                     topK: topK
                 ).asType(.int32)
-                eval(residualToken)
                 previousCodebooks = concatenated(
                     [previousCodebooks, residualToken.reshaped([1, 1])],
                     axis: 1
@@ -861,13 +897,14 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                 fastHidden = model.fastEmbeddings(residualToken)
             }
 
-            generatedSteps.append(previousCodebooks.asArray(Int32.self))
-
             let nextInput = concatenated(
                 [semanticToken.asType(.int32).reshaped([1, 1]), previousCodebooks],
                 axis: 1
             ).expandedDimensions(axis: 2)
             result = model(nextInput, cache: cache)
+            // One GPU sync per frame: the codebooks and the next slow step share a graph.
+            eval(previousCodebooks, result.logits, result.hiddenStates)
+            generatedSteps.append(previousCodebooks.asArray(Int32.self))
             logits = result.logits[0..., (result.logits.dim(1) - 1)..<result.logits.dim(1), 0...]
                 .squeezed(axis: 1)
             hiddenState = result.hiddenStates[0..., (result.hiddenStates.dim(1) - 1)..<result.hiddenStates.dim(1), 0...]

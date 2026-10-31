@@ -1451,6 +1451,56 @@ struct FishSpeechTests {
         #expect(allClose(on.embedded[0..., 1 ..< 2, 0...], on.expected[0..., 1 ..< 2, 0...], atol: 1e-5).item(Bool.self))
     }
 
+    private func makeSemanticSamplingModel() -> (FishSpeechModel, imEnd: Int) {
+        var config = makeTinyFishSpeechConfig()
+        config.semanticStartTokenID = 20
+        config.semanticEndTokenID = 40
+        let model = FishSpeechModel(config: config)
+        let imEnd = 100
+        model.imEndTokenID = imEnd
+        var bias = Array(repeating: Float(-1e9), count: 128)
+        for index in 20 ... 40 { bias[index] = 0 }
+        bias[imEnd] = 0
+        model.semanticLogitBias = MLXArray(bias).reshaped([1, 128])
+        return (model, imEnd)
+    }
+
+    @Test func testSampleSemanticOnlyReturnsAllowedIDs() throws {
+        let (model, imEnd) = makeSemanticSamplingModel()
+        for _ in 0 ..< 500 {
+            let logits = MLXRandom.normal([1, 128]) * 3
+            let token = try model.sampleSemantic(
+                logits: logits, previousSemanticTokens: [25, 30], topP: 0.9, topK: 30, temperature: 1.0
+            )
+            let id = Int(token.item(Int32.self))
+            #expect((20 ... 40).contains(id) || id == imEnd)
+        }
+    }
+
+    @Test func testSampleSemanticGreedyMatchesFullVocabArgmax() throws {
+        let (model, _) = makeSemanticSamplingModel()
+        let bias = try #require(model.semanticLogitBias)
+        for _ in 0 ..< 50 {
+            let logits = MLXRandom.normal([1, 128]) * 3
+            let token = try model.sampleSemantic(
+                logits: logits, previousSemanticTokens: [], topP: 0.9, topK: 30, temperature: 0
+            )
+            let expected = argMax(logits + bias, axis: -1).item(Int32.self)
+            #expect(token.item(Int32.self) == expected)
+        }
+    }
+
+    @Test func testTopKPartialSortKeepsOnlyTopK() {
+        let logits = MLXArray((0 ..< 64).map { Float($0) * 0.05 }).reshaped([1, 64])
+        let top5 = Set((59 ..< 64).map { Int32($0) })
+        var seen = Set<Int32>()
+        for _ in 0 ..< 2000 {
+            seen.insert(fishSpeechSampleToken(logits: logits, temperature: 1.0, topP: 1.0, topK: 5).item(Int32.self))
+        }
+        #expect(seen.isSubset(of: top5))
+        #expect(seen.count > 1)
+    }
+
     @Test func testDefaultRepositoryID() {
         #expect(FishSpeechModel.defaultRepositoryID == "mlx-community/fish-audio-s2-pro-8bit")
     }
