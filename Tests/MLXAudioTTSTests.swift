@@ -1333,6 +1333,78 @@ struct EchoTTSTests {
     }
 }
 
+/// Fake tokenizer whose semantic ids sit inside the tiny model's vocabulary.
+private struct TinyStreamFishTokenizer: FishSpeechTokenizing {
+    let vocabSize = 128
+    let eosTokenID = 99
+    let padTokenID = 0
+    let semanticBeginID = 20
+    let semanticEndID = 51
+
+    func encode(_ text: String, addSpecialTokens: Bool) -> [Int] {
+        if text.hasPrefix("<|") { return [11] }
+        return text.utf8.map { Int($0) % 70 + 52 }
+    }
+    func decode(_ tokens: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func tokenID(for token: String) -> Int? {
+        token == fishSpeechIMEndToken ? 12 : (token == fishSpeechPadToken ? 0 : nil)
+    }
+}
+
+/// Tiny Fish model + a real-geometry (2048 samples/frame) tiny codec, random weights.
+private func makeTinyStreamingFishModel() -> FishSpeechModel {
+    var config = makeTinyFishSpeechConfig()
+    config.semanticStartTokenID = 20
+    config.semanticEndTokenID = 51
+    config.maxFramesPerTextToken = 12
+    config.textConfig.maxSeqLen = 1_024
+    let model = FishSpeechModel(config: config)
+    model.tokenizer = TinyStreamFishTokenizer()
+    model.imEndTokenID = 12
+    var bias = Array(repeating: Float(-1e9), count: 128)
+    for index in 20 ... 51 { bias[index] = 0 }   // never emit im_end: always run to budget
+    model.semanticLogitBias = MLXArray(bias).reshaped([1, 128])
+
+    let args = FishS1DACModelArgs(
+        blockSize: 4096, nLayer: 2, nHead: 2, dim: 16, intermediateSize: 32, headDim: 8,
+        channelsFirst: true)
+    let quantizer = FishS1DownsampleResidualVectorQuantize(
+        inputDim: 16, nCodebooks: 1, codebookDim: 4, codebookSize: 32,
+        semanticCodebookSize: 32, downsampleFactor: [2, 2],
+        preModule: FishS1Identity(),
+        postModule: FishS1WindowLimitedTransformer(
+            config: args, inputDim: 16, windowSize: 4, causal: true))
+    let codec = FishS1DAC(
+        encoderDim: 4, encoderRates: [2, 4, 8, 8], latentDim: 16, decoderDim: 16,
+        decoderRates: [8, 8, 4, 2], quantizer: quantizer, sampleRate: 44_100, causal: true,
+        encoderTransformerLayers: [0, 0, 0, 0], decoderTransformerLayers: [0, 0, 0, 0],
+        transformerConfigFactory: nil)
+    for stage in quantizer.upsample { stage.block.gamma = MLXArray.ones([16]) }
+    model.codec = codec
+    eval(model, codec)
+    return model
+}
+
+private func fishTestParams() -> GenerateParameters {
+    GenerateParameters(maxTokens: 40, temperature: 1.0, topP: 1.0)
+}
+
+private func collectFishStream(
+    _ stream: AsyncThrowingStream<AudioGeneration, Error>
+) async throws -> (chunks: [MLXArray], infoCount: Int) {
+    var chunks: [MLXArray] = []
+    var infos = 0
+    for try await event in stream {
+        switch event {
+        case .audio(let audio): chunks.append(audio)
+        case .info: infos += 1
+        case .token: break
+        }
+    }
+    return (chunks, infos)
+}
+
+@Suite(.serialized)
 struct FishSpeechTests {
 
     @Test func testConfigDecodesQuantizationAlias() throws {
@@ -1353,6 +1425,45 @@ struct FishSpeechTests {
         #expect(config.modelType == "fish_qwen3_omni")
         #expect(config.sampleRate == 44_100)
         #expect(config.quantization == BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+    }
+
+    @Test func testSemanticBudgetDefaultMatchesLegacy() {
+        #expect(fishSpeechSemanticBudget(textTokenCount: 10, maxNewTokens: 1024, framesPerTextToken: 12) == 120)
+        #expect(fishSpeechSemanticBudget(textTokenCount: 2, maxNewTokens: 1024, framesPerTextToken: 12) == 32)
+        #expect(fishSpeechSemanticBudget(textTokenCount: 200, maxNewTokens: 1024, framesPerTextToken: 12) == 1024)
+    }
+
+    @Test func testSemanticBudgetUsesConfigRatio() {
+        #expect(fishSpeechSemanticBudget(textTokenCount: 40, maxNewTokens: 1024, framesPerTextToken: 4.5) == 180)
+    }
+
+    @Test func testConfigDecodesMaxFramesPerTextToken() throws {
+        let absent = try JSONDecoder().decode(
+            FishSpeechConfig.self, from: Data(#"{"model_type":"fish_qwen3_omni"}"#.utf8))
+        #expect(absent.maxFramesPerTextToken == 12)
+        let set = try JSONDecoder().decode(
+            FishSpeechConfig.self,
+            from: Data(#"{"model_type":"fish_qwen3_omni","max_frames_per_text_token":4.5}"#.utf8))
+        #expect(set.maxFramesPerTextToken == 4.5)
+    }
+
+    @Test func testFramesPerTextTokenFromReference() {
+        #expect(fishSpeechFramesPerTextToken(refFrames: nil, refTextTokenCount: nil, configMax: 12, referenceScale: 1.5) == 12)
+        #expect(fishSpeechFramesPerTextToken(refFrames: 300, refTextTokenCount: 0, configMax: 12, referenceScale: 1.5) == 12)
+        #expect(fishSpeechFramesPerTextToken(refFrames: 300, refTextTokenCount: 60, configMax: 12, referenceScale: 1.5) == 7.5)
+        #expect(fishSpeechFramesPerTextToken(refFrames: 3000, refTextTokenCount: 60, configMax: 12, referenceScale: 1.5) == 12)
+        let r = fishSpeechFramesPerTextToken(refFrames: 300, refTextTokenCount: 60, configMax: 12, referenceScale: 1.5)
+        #expect(fishSpeechSemanticBudget(textTokenCount: 40, maxNewTokens: 1024, framesPerTextToken: r) == 300)
+    }
+
+    @Test func testConfigDecodesReferenceBudgetScale() throws {
+        let absent = try JSONDecoder().decode(
+            FishSpeechConfig.self, from: Data(#"{"model_type":"fish_qwen3_omni"}"#.utf8))
+        #expect(absent.referenceBudgetScale == nil)
+        let set = try JSONDecoder().decode(
+            FishSpeechConfig.self,
+            from: Data(#"{"model_type":"fish_qwen3_omni","reference_budget_scale":1.6}"#.utf8))
+        #expect(set.referenceBudgetScale == 1.6)
     }
 
     @Test func testConversationEncodingInterleavesSemanticAndCodebookRows() {
@@ -1401,6 +1512,239 @@ struct FishSpeechTests {
         #expect(sanitized["model.codebook_embeddings.weight"] != nil)
         #expect(sanitized["model.fast_layers.0.attention.wqkv.weight"] != nil)
         #expect(sanitized["model.norm.weight"] != nil)
+    }
+
+    @Test func testFishConfigScaleCodebookEmbeddingsDefaultsTrue() throws {
+        let without = try JSONDecoder().decode(FishSpeechConfig.self, from: Data("{}".utf8))
+        #expect(without.scaleCodebookEmbeddings == true)
+
+        let off = try JSONDecoder().decode(
+            FishSpeechConfig.self,
+            from: Data(#"{"scale_codebook_embeddings": false}"#.utf8)
+        )
+        #expect(off.scaleCodebookEmbeddings == false)
+    }
+
+    @Test func testFishEmbedSkipsScaleWhenDisabled() {
+        var config = makeTinyFishSpeechConfig()
+        config.semanticStartTokenID = 20
+        config.semanticEndTokenID = 40
+        let numCodebooks = config.audioDecoderConfig.numCodebooks
+        let vocab = config.audioDecoderConfig.vocabSize
+
+        // [batch, 1 + numCodebooks, seq]: a semantic token at position 0, a plain text token at 1.
+        let input = MLXArray([Int32(25), 3, 4, 7, 5, 6] as [Int32]).reshaped([1, 3, 2])
+
+        func run(scale: Bool) -> (embedded: MLXArray, expected: MLXArray) {
+            config.scaleCodebookEmbeddings = scale
+            let model = FishSpeechModel(config: config)
+            let embedded = model.model.embed(input)
+            var sum = model.model.embeddings(input[0..., 0, 0...])
+            for index in 0 ..< numCodebooks {
+                let row = input[0..., index + 1, 0...] + Int32(index * vocab)
+                sum = sum + MLX.where(
+                    MLXArray([true, false]).reshaped([1, 2, 1]),
+                    model.model.codebookEmbeddings(row),
+                    MLXArray.zeros(sum.shape, dtype: sum.dtype)
+                )
+            }
+            return (embedded, sum)
+        }
+
+        let off = run(scale: false)
+        #expect(allClose(off.embedded, off.expected, atol: 1e-5).item(Bool.self))
+
+        let on = run(scale: true)
+        let divisor = Float(sqrt(Double(numCodebooks + 1)))
+        let scaledPosition = on.expected[0..., 0 ..< 1, 0...] / divisor
+        #expect(allClose(on.embedded[0..., 0 ..< 1, 0...], scaledPosition, atol: 1e-5).item(Bool.self))
+        // The non-semantic position is never scaled.
+        #expect(allClose(on.embedded[0..., 1 ..< 2, 0...], on.expected[0..., 1 ..< 2, 0...], atol: 1e-5).item(Bool.self))
+    }
+
+    private func makeSemanticSamplingModel() -> (FishSpeechModel, imEnd: Int) {
+        var config = makeTinyFishSpeechConfig()
+        config.semanticStartTokenID = 20
+        config.semanticEndTokenID = 40
+        let model = FishSpeechModel(config: config)
+        let imEnd = 100
+        model.imEndTokenID = imEnd
+        var bias = Array(repeating: Float(-1e9), count: 128)
+        for index in 20 ... 40 { bias[index] = 0 }
+        bias[imEnd] = 0
+        model.semanticLogitBias = MLXArray(bias).reshaped([1, 128])
+        return (model, imEnd)
+    }
+
+    @Test func testSampleSemanticOnlyReturnsAllowedIDs() throws {
+        let (model, imEnd) = makeSemanticSamplingModel()
+        for _ in 0 ..< 500 {
+            let logits = MLXRandom.normal([1, 128]) * 3
+            let token = try model.sampleSemantic(
+                logits: logits, previousSemanticTokens: [25, 30], topP: 0.9, topK: 30, temperature: 1.0
+            )
+            let id = Int(token.item(Int32.self))
+            #expect((20 ... 40).contains(id) || id == imEnd)
+        }
+    }
+
+    @Test func testSampleSemanticGreedyMatchesFullVocabArgmax() throws {
+        let (model, _) = makeSemanticSamplingModel()
+        let bias = try #require(model.semanticLogitBias)
+        for _ in 0 ..< 50 {
+            let logits = MLXRandom.normal([1, 128]) * 3
+            let token = try model.sampleSemantic(
+                logits: logits, previousSemanticTokens: [], topP: 0.9, topK: 30, temperature: 0
+            )
+            let expected = argMax(logits + bias, axis: -1).item(Int32.self)
+            #expect(token.item(Int32.self) == expected)
+        }
+    }
+
+    @Test func testTopKPartialSortKeepsOnlyTopK() {
+        let logits = MLXArray((0 ..< 64).map { Float($0) * 0.05 }).reshaped([1, 64])
+        let top5 = Set((59 ..< 64).map { Int32($0) })
+        var seen = Set<Int32>()
+        for _ in 0 ..< 2000 {
+            seen.insert(fishSpeechSampleToken(logits: logits, temperature: 1.0, topP: 1.0, topK: 5).item(Int32.self))
+        }
+        #expect(seen.isSubset(of: top5))
+        #expect(seen.count > 1)
+    }
+
+    @Test func testFishStreamChunksConcatenateToFullRender() async throws {
+        MLXRandom.seed(3)
+        let model = makeTinyStreamingFishModel()
+        let ref = MLXRandom.normal([44_100]) * 0.1
+        let refCodes = try model.encodeReference(ref)
+        let text = "hello streaming world, this is a long enough line"
+
+        MLXRandom.seed(7)
+        let full = try await model.generate(
+            text: text, refCodes: refCodes, refText: "ref", generationParameters: fishTestParams())
+
+        MLXRandom.seed(7)
+        let (chunks, infos) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: refCodes, refText: "ref",
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(full.dim(0) >= 20 * 2048)
+        // The reported generated-frame count times the hop is exactly the output length.
+        MLXRandom.seed(7)
+        var generatedFrames = 0
+        for try await event in model.generateStream(
+            text: text, refCodes: refCodes, refText: "ref",
+            generationParameters: fishTestParams(), streamingInterval: 0.5)
+        {
+            if case .info(let info) = event { generatedFrames = info.generationTokenCount }
+        }
+        #expect(full.dim(0) == generatedFrames * 2048)
+        // Primed one-shot crop is exact: output is only the generated frames (no reference audio).
+        #expect(model.leftContextFrames > 0 && refCodes.dim(1) >= model.leftContextFrames)
+        #expect(chunks.count > 1)
+        #expect(infos == 1)
+        let joined = concatenated(chunks, axis: 0)
+        #expect(joined.shape == full.shape)
+        #expect(allClose(joined, full, atol: 1e-4).item(Bool.self))
+
+        // With no reference there is nothing to prime from; chunks must still join exactly.
+        MLXRandom.seed(7)
+        let bare = try await model.generate(
+            text: text, refCodes: nil, refText: nil, generationParameters: fishTestParams())
+        MLXRandom.seed(7)
+        let (bareChunks, _) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: nil, refText: nil,
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(bareChunks.count > 1)
+        #expect(allClose(concatenated(bareChunks, axis: 0), bare, atol: 1e-4).item(Bool.self))
+
+        // Context shorter than the receptive field must break the join (else the check is vacuous).
+        model.leftContextFramesOverride = 0
+        MLXRandom.seed(7)
+        let (cold, _) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: nil, refText: nil,
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(!allClose(concatenated(cold, axis: 0), bare, atol: 1e-4).item(Bool.self))
+    }
+
+    @Test func testFishRefCodesPathMatchesRefAudioPath() async throws {
+        MLXRandom.seed(3)
+        let model = makeTinyStreamingFishModel()
+        let ref = MLXRandom.normal([44_100]) * 0.1
+        let refCodes = try model.encodeReference(ref)
+        #expect(refCodes.ndim == 2)
+        #expect(refCodes.dim(0) == 2)
+        #expect(refCodes.dtype == .int32)
+        let text = "hello streaming world, this is a long enough line"
+
+        MLXRandom.seed(7)
+        let fromAudio = try await model.generate(
+            text: text, voice: nil, refAudio: ref, refText: "ref", language: nil,
+            generationParameters: fishTestParams())
+        MLXRandom.seed(7)
+        let fromCodes = try await model.generate(
+            text: text, refCodes: refCodes, refText: "ref", generationParameters: fishTestParams())
+        #expect(fromAudio.shape == fromCodes.shape)
+        #expect(allClose(fromAudio, fromCodes, atol: 1e-5).item(Bool.self))
+
+        MLXRandom.seed(7)
+        let (audioChunks, _) = try await collectFishStream(model.generateStream(
+            text: text, voice: nil, refAudio: ref, refText: "ref", language: nil,
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        MLXRandom.seed(7)
+        let (codeChunks, _) = try await collectFishStream(model.generateStream(
+            text: text, refCodes: refCodes, refText: "ref",
+            generationParameters: fishTestParams(), streamingInterval: 0.5))
+        #expect(audioChunks.count == codeChunks.count)
+        #expect(allClose(
+            concatenated(audioChunks, axis: 0), concatenated(codeChunks, axis: 0), atol: 1e-5
+        ).item(Bool.self))
+    }
+
+    @Test func testFishRefCodesRejectsWrongShape() async throws {
+        MLXRandom.seed(3)
+        let model = makeTinyStreamingFishModel()
+        let good = try model.encodeReference(MLXRandom.normal([44_100]) * 0.1)
+        let transposed = good.transposed(1, 0)
+        await #expect(throws: AudioGenerationError.self) {
+            _ = try await model.generate(
+                text: "hello there", refCodes: transposed, refText: "ref",
+                generationParameters: fishTestParams())
+        }
+        await #expect(throws: AudioGenerationError.self) {
+            _ = try await collectFishStream(model.generateStream(
+                text: "hello there", refCodes: transposed, refText: "ref",
+                generationParameters: fishTestParams(), streamingInterval: 0.5))
+        }
+        await #expect(throws: AudioGenerationError.self) {
+            _ = try await model.generate(
+                text: "hello there", refCodes: good[0..., 0 ..< 0], refText: "ref",
+                generationParameters: fishTestParams())
+        }
+    }
+
+    @Test func testFishChunkSizeStretchesWhenDecodeDominates() {
+        // Plenty of lead (30 s): decode cheap stays at the requested size.
+        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.01, generateSeconds: 1, generatedFrames: 7, leadSeconds: 30) == 7)
+        // Decode costs more than a tenth of generation: double, capped.
+        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 7, leadSeconds: 30) == 14)
+        #expect(fishNextChunkFrames(current: 80, requested: 7, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 80, leadSeconds: 30) == 100)
+        // Cheap again: halve back, never below the request.
+        #expect(fishNextChunkFrames(current: 56, requested: 7, decodeSeconds: 0.01, generateSeconds: 1, generatedFrames: 56, leadSeconds: 30) == 28)
+        #expect(fishNextChunkFrames(current: 10, requested: 7, decodeSeconds: 0.01, generateSeconds: 1, generatedFrames: 10, leadSeconds: 30) == 7)
+    }
+
+    @Test func testFishChunkSizeNeverGrowsPastTheLead() {
+        // 22 frames took 1 s (about 0.045 s per frame). Decode dominates, so it wants 44 frames
+        // (2 s + 0.5 s decode + 0.5 margin = 3 s), but only 1.0 s of lead exists: stay small.
+        #expect(fishNextChunkFrames(current: 22, requested: 22, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 22, leadSeconds: 1.0) == 22)
+        // No lead at all (first chunk just went out): never above the request.
+        #expect(fishNextChunkFrames(current: 22, requested: 22, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 22, leadSeconds: 0) == 22)
+        // A big lead lets it grow; a lead that fits 44 frames but not 88 stops at 44.
+        #expect(fishNextChunkFrames(current: 22, requested: 22, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 22, leadSeconds: 3.5) == 44)
+        #expect(fishNextChunkFrames(current: 44, requested: 22, decodeSeconds: 0.5, generateSeconds: 2, generatedFrames: 44, leadSeconds: 3.5) == 44)
+        #expect(fishNextChunkFrames(current: 44, requested: 22, decodeSeconds: 0.5, generateSeconds: 2, generatedFrames: 44, leadSeconds: 2.0) == 22)
+        // A grown chunk shrinks when the lead has been used up, but never below the request.
+        #expect(fishNextChunkFrames(current: 100, requested: 22, decodeSeconds: 0.5, generateSeconds: 4.5, generatedFrames: 100, leadSeconds: 0.2) == 22)
     }
 
     @Test func testDefaultRepositoryID() {

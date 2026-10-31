@@ -33,6 +33,7 @@
 
 import Testing
 import MLX
+import MLXNN
 import Foundation
 
 @testable import MLXAudioCore
@@ -923,6 +924,151 @@ struct DescriptDACTests {
 // MARK: - Fish S1 DAC Tests
 
 struct FishS1DACTests {
+
+    @Test func testFishS1AttentionGroupedQueryShapes() {
+        let attention = FishS1Attention(
+            config: FishS1DACModelArgs(nHead: 16, dim: 1024, nLocalHeads: 8, headDim: 64)
+        )
+        let x = MLXRandom.normal([1, 37, 1024])
+        let y = attention(x, freqsCis: nil, mask: nil)
+        #expect(y.shape == [1, 37, 1024])
+    }
+
+    @Test func testBuildFishS1DACPostModuleOverrides() {
+        var config = FishS1DACBuildConfig()
+        config.quantizerPostTransformerLayers = 8
+        config.quantizerPostTransformerHeads = 16
+        config.quantizerPostTransformerLocalHeads = 8
+        config.quantizerPostTransformerIntermediateSize = 1216
+        let codec = buildFishS1DAC(config)
+
+        let post = codec.quantizer.postModule as! FishS1WindowLimitedTransformer
+        #expect(post.layers.count == 8)
+        #expect(post.layers[0].attention.nHead == 16)
+        #expect(post.layers[0].attention.nLocalHeads == 8)
+        #expect(post.layers[0].feedForward.w1.weight.shape == [1216, 1024])
+
+        let pre = codec.quantizer.preModule as! FishS1WindowLimitedTransformer
+        #expect(pre.layers[0].attention.nHead == 16)
+        #expect(pre.layers[0].attention.nLocalHeads == 16)
+        #expect(pre.layers[0].feedForward.w1.weight.shape == [3072, 1024])
+    }
+
+    /// Small causal codec with a window-limited post transformer, random weights, ConvNeXt layer
+    /// scales raised to 1 so context actually matters.
+    private func makeIncrementalTestCodec() -> FishS1DAC {
+        let args = FishS1DACModelArgs(
+            blockSize: 256, nLayer: 2, nHead: 2, dim: 16, intermediateSize: 32, headDim: 8,
+            channelsFirst: true)
+        let quantizer = FishS1DownsampleResidualVectorQuantize(
+            inputDim: 16, nCodebooks: 2, codebookDim: 4, codebookSize: 16,
+            semanticCodebookSize: 32, downsampleFactor: [2, 2],
+            preModule: FishS1Identity(),
+            postModule: FishS1WindowLimitedTransformer(
+                config: args, inputDim: 16, windowSize: 4, causal: true))
+        let model = FishS1DAC(
+            encoderDim: 4, encoderRates: [2, 2], latentDim: 16, decoderDim: 16,
+            decoderRates: [2, 2], quantizer: quantizer, sampleRate: 44_100, causal: true,
+            encoderTransformerLayers: [0, 0], decoderTransformerLayers: [0, 0],
+            transformerConfigFactory: nil)
+        for stage in quantizer.upsample { stage.block.gamma = MLXArray.ones([16]) }
+        eval(model)
+        return model
+    }
+
+    private func incrementalMaxDiff(_ model: FishS1DAC, left: Int, step: Int = 8, frames: Int = 64) -> Float {
+        let codes = MLXRandom.uniform(low: 0, high: 15.99, [1, 3, frames]).asType(.int32)
+        let oneShot = model.decode(codes, featureLengths: MLXArray([Int32(frames)])).0[0, 0]
+        var parts: [MLXArray] = []
+        var end = step
+        while end <= frames {
+            parts.append(model.decodeIncremental(
+                codes[0..., 0..., 0..<end], leftContextFrames: left, newFrames: step))
+            end += step
+        }
+        let joined = concatenated(parts, axis: 0)
+        #expect(joined.shape == oneShot.shape)
+        return abs(joined - oneShot).max().item(Float.self)
+    }
+
+    @Test func testFishS1DACIncrementalDecodeMatchesOneShot() {
+        MLXRandom.seed(3)
+        let model = makeIncrementalTestCodec()
+        let rf = model.decoderReceptiveFieldFrames
+        #expect(rf > 0 && rf < 64)
+        #expect(incrementalMaxDiff(model, left: rf) < 1e-4)
+        // Too little context must visibly differ, or the test proves nothing.
+        #expect(incrementalMaxDiff(model, left: 0) > 1e-4)
+        // newFrames == nil: first `left` frames are context only.
+        let codes = MLXRandom.uniform(low: 0, high: 15.99, [1, 3, 24]).asType(.int32)
+        let full = model.decode(codes, featureLengths: MLXArray([Int32(24)])).0[0, 0]
+        let tail = model.decodeIncremental(codes, leftContextFrames: 16)
+        #expect(tail.shape == [8 * model.frameLength])
+        #expect(allClose(tail, full[(16 * model.frameLength)...], atol: 1e-4).item(Bool.self))
+    }
+
+    /// A chunk longer than one conv pass runs in several passes; the join must not change the audio.
+    @Test func testFishS1DACLongChunkDecodesInPassesExactly() {
+        MLXRandom.seed(5)
+        let model = makeIncrementalTestCodec()
+        let rf = model.decoderReceptiveFieldFrames
+        let frames = FishS1DAC.maxNewFramesPerPass * 3 + 5
+        #expect(frames > 2 * FishS1DAC.maxNewFramesPerPass)
+        #expect(incrementalMaxDiff(model, left: rf, step: frames, frames: frames) < 1e-4)
+    }
+
+    /// Folding weight norm at load must give the same audio as recomputing it every call.
+    @Test func testFishS1DACFoldWeightNormKeepsOutput() {
+        MLXRandom.seed(6)
+        let model = makeIncrementalTestCodec()
+        let codes = MLXRandom.uniform(low: 0, high: 15.99, [1, 3, 24]).asType(.int32)
+        let lengths = MLXArray([Int32(24)])
+        let before = model.decode(codes, featureLengths: lengths).0
+        let wave = MLXRandom.uniform(low: -1, high: 1, [1, 1, 4096])
+        let codesBefore = model.encode(wave).0
+        model.foldWeightNorm()
+        model.foldWeightNorm() // idempotent
+        let after = model.decode(codes, featureLengths: lengths).0
+        let n = min(before.dim(2), after.dim(2))
+        #expect(before.dim(2) == after.dim(2))
+        // The polyphase transposed conv sums in a different order (GPU conv), so ~1e-4, not bit-equal.
+        #expect(allClose(before[0..., 0..., 0 ..< n], after[0..., 0..., 0 ..< n], atol: 5e-4).item(Bool.self))
+        #expect(allClose(codesBefore, model.encode(wave).0).item(Bool.self))
+    }
+
+    /// Non-causal weight-normed convs fold to the same output, and the folded weight is not a parameter.
+    @Test func testFishS1NonCausalWNFoldKeepsOutput() {
+        MLXRandom.seed(7)
+        let conv = FishS1WNConv1d(inChannels: 4, outChannels: 6, kernelSize: 3, padding: 1)
+        let up = FishS1WNConvTranspose1d(inChannels: 6, outChannels: 4, kernelSize: 4, stride: 2, padding: 1)
+        let x = MLXRandom.normal([1, 4, 17])
+        let convBefore = conv(x)
+        let upBefore = up(convBefore)
+        conv.foldWeightNorm()
+        conv.foldWeightNorm() // idempotent
+        up.foldWeightNorm()
+        #expect(allClose(conv(x), convBefore, atol: 1e-5).item(Bool.self))
+        #expect(allClose(up(conv(x)), upBefore, atol: 1e-5).item(Bool.self))
+        let keys = Set(conv.parameters().flattened().map(\.0) + up.parameters().flattened().map(\.0))
+        #expect(!keys.contains { $0.contains("folded") })
+    }
+
+    @Test func testFishS1PolyphaseTransposedConvMatchesDirect() {
+        MLXRandom.seed(8)
+        for stride in [2, 4, 8] {
+            let layer = FishS1CausalWNConvTranspose1d(
+                inChannels: 6, outChannels: 5, kernelSize: 2 * stride, stride: stride)
+            layer.bias = MLXRandom.normal([5])
+            let x = MLXRandom.normal([1, 6, 9])
+            let direct = layer(x)
+            layer.foldWeightNorm()
+            let fast = layer(x)
+            #expect(fast.dim(2) == 9 * stride)
+            #expect(direct.dim(2) >= fast.dim(2))
+            let diff = abs(direct[0..., 0..., 0 ..< fast.dim(2)] - fast).max().item(Float.self)
+            #expect(diff < 1e-5, "stride \(stride) diff \(diff)")
+        }
+    }
 
     @Test func testTinyEncodeDecode() throws {
         let quantizer = FishS1DownsampleResidualVectorQuantize(
