@@ -430,13 +430,18 @@ public final class FishS1DAC: Module {
             guard let window = post.windowSize else { return Int.max }
             frames += post.layers.count * (window - 1)
         }
-        // Samples (at the stage's rate) per code frame, walking the upsample stages and decoder.
-        var perFrame = 1
+        return frames + convReceptiveFieldFrames
+    }
+
+    /// Frames of look-back in the conv stages after the transformer (upsample + decoder).
+    public var convReceptiveFieldFrames: Int {
+        var frames = 0
+        var perFrame = 1 // samples (at the current stage's rate) per code frame
         for stage in quantizer.upsample {
             perFrame *= stage.conv.stride
             frames += (6 + perFrame - 1) / perFrame
         }
-        frames += (6 + perFrame - 1) / perFrame          // decoder input conv
+        frames += (6 + perFrame - 1) / perFrame // decoder input conv
         for rate in decoderRates {
             perFrame *= rate
             frames += (1 + 78 + perFrame - 1) / perFrame // transposed conv + residual units
@@ -458,8 +463,17 @@ public final class FishS1DAC: Module {
         guard new > 0 else { return MLXArray.zeros([0], dtype: .float32) }
         let context = min(max(leftContextFrames, 0), total - new)
         let window = codes[0..., 0..., (total - new - context)..<total]
-        let (audio, _) = decode(window, featureLengths: MLXArray([Int32(window.dim(2))]))
-        return audio[0, 0, (context * frameLength)..<((context + new) * frameLength)]
+        // The transformer needs the whole window (its receptive field is long) but is cheap; the
+        // conv stages are the cost and only look back `convReceptiveFieldFrames`, so run them on
+        // just the new frames plus that margin.
+        var z = quantizer.decodePostModule(window)
+        let keep = min(z.dim(2), new + convReceptiveFieldFrames)
+        z = z[0..., 0..., (z.dim(2) - keep)...]
+        for stage in quantizer.upsample {
+            z = stage(z)
+        }
+        let audio = decoder(z)
+        return audio[0, 0, ((keep - new) * frameLength)..<(keep * frameLength)]
     }
 
     public func encodeZQ(_ audioData: MLXArray) -> MLXArray {

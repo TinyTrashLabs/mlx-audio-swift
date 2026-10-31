@@ -314,6 +314,16 @@ public final class FishS1DownsampleResidualVectorQuantize: Module {
     }
 
     public func decode(_ indices: MLXArray) -> MLXArray {
+        var zQ = decodePostModule(indices)
+        for stage in upsample {
+            zQ = stage(zQ)
+        }
+        return zQ
+    }
+
+    /// Codes to features after the (window-limited) post transformer, before upsampling.
+    /// Frame-aligned with the codes, so callers can crop frames before the heavy conv stages.
+    public func decodePostModule(_ indices: MLXArray) -> MLXArray {
         let semanticIndices = MLX.clip(
             indices[0..., 0..<1, 0...],
             min: 0,
@@ -333,10 +343,6 @@ public final class FishS1DownsampleResidualVectorQuantize: Module {
             zQResidual = MLXArray.zeros(zQSemantic.shape, dtype: zQSemantic.dtype)
         }
 
-        var zQ = fishS1CallUnary(postModule, zQSemantic + zQResidual)
-        for stage in upsample {
-            zQ = stage(zQ)
-        }
-        return zQ
+        return fishS1CallUnary(postModule, zQSemantic + zQResidual)
     }
 }

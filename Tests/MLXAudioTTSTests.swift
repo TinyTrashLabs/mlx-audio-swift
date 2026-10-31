@@ -1722,6 +1722,17 @@ struct FishSpeechTests {
         }
     }
 
+    @Test func testFishChunkSizeStretchesWhenDecodeDominates() {
+        // Decode cheap: stay at the requested size.
+        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.01, generateSeconds: 1) == 7)
+        // Decode costs more than a tenth of generation: double, capped.
+        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.5, generateSeconds: 1) == 14)
+        #expect(fishNextChunkFrames(current: 80, requested: 7, decodeSeconds: 0.5, generateSeconds: 1) == 100)
+        // Cheap again: halve back, never below the request.
+        #expect(fishNextChunkFrames(current: 56, requested: 7, decodeSeconds: 0.01, generateSeconds: 1) == 28)
+        #expect(fishNextChunkFrames(current: 10, requested: 7, decodeSeconds: 0.01, generateSeconds: 1) == 7)
+    }
+
     @Test func testDefaultRepositoryID() {
         #expect(FishSpeechModel.defaultRepositoryID == "mlx-community/fish-audio-s2-pro-8bit")
     }

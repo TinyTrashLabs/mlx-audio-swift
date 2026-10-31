@@ -1106,9 +1106,13 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         var segments: [FishSpeechGeneratedSegment] = []
         segments.reserveCapacity(batches.count)
 
-        let chunkFrames = streaming.map {
+        let requestedChunkFrames = streaming.map {
             max(1, Int((($0.intervalSeconds * Double(codec.sampleRate)) / Double(codec.frameLength)).rounded()))
         }
+        // Decode cost has a fixed part (transformer window + conv margin), so a tiny interval can
+        // cost more than generation; the live chunk size stretches to keep decode a small share.
+        var chunkFrames = requestedChunkFrames ?? 1
+        var lastMark = CFAbsoluteTimeGetCurrent()
         let context = leftContextFrames
         // Deliberate: every batch (not just the first) is primed with the reference tail, the same
         // primer in stream and one-shot, so both decode identically.
@@ -1151,6 +1155,7 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                 if let primer, primerFrames > 0 {
                     window = concatenated([primer[0..., (primer.dim(1) - primerFrames)...], window], axis: 1)
                 }
+                let decodeStart = CFAbsoluteTimeGetCurrent()
                 let audio = codec.decodeIncremental(
                     window.expandedDimensions(axis: 0),
                     leftContextFrames: primerFrames + (emitted - contextStart),
@@ -1160,6 +1165,11 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                 try Task.checkCancellation()
                 streaming.yield(audio)
                 emitted = end
+                let now = CFAbsoluteTimeGetCurrent()
+                chunkFrames = fishNextChunkFrames(
+                    current: chunkFrames, requested: requestedChunkFrames ?? 1,
+                    decodeSeconds: now - decodeStart, generateSeconds: decodeStart - lastMark)
+                lastMark = now
             }
 
             let codes = try generateCodesForBatch(
@@ -1171,11 +1181,9 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                 temperature: temperature,
                 refFrames: refFrames,
                 refTextTokenCount: refTextTokenCount,
-                onFrame: chunkFrames.map { chunkFrames in
-                    { steps in
-                        if steps.count - emitted >= chunkFrames {
-                            try emitChunk(steps: steps, end: steps.count)
-                        }
+                onFrame: requestedChunkFrames == nil ? nil : { steps in
+                    if steps.count - emitted >= chunkFrames {
+                        try emitChunk(steps: steps, end: steps.count)
                     }
                 }
             )
@@ -1295,4 +1303,20 @@ func fishSpeechFramesPerTextToken(
 struct FishStreamingSink {
     let intervalSeconds: Double
     let yield: (MLXArray) -> Void
+}
+
+/// Next streaming chunk size in frames. Each chunk's decode has a fixed cost, so when decoding
+/// takes more than a tenth of the time spent generating the chunk, double the size (up to
+/// `maxFrames`); when it is cheap again, halve back toward what the caller asked for.
+func fishNextChunkFrames(
+    current: Int, requested: Int, decodeSeconds: Double, generateSeconds: Double,
+    maxFrames: Int = 100
+) -> Int {
+    if decodeSeconds > 0.1 * generateSeconds {
+        return min(max(current, requested) * 2, max(maxFrames, requested))
+    }
+    if decodeSeconds < 0.04 * generateSeconds {
+        return max(requested, current / 2)
+    }
+    return current
 }
