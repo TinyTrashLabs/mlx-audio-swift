@@ -304,7 +304,7 @@ final class FishSpeechDualARTransformer: Module {
         fastLayers.map { _ in KVCacheSimple() }
     }
 
-    private func embed(_ input: MLXArray) -> MLXArray {
+    func embed(_ input: MLXArray) -> MLXArray {
         let semanticIDs = input[0..., 0, 0...]
         let codebookRows = input[0..., 1..., 0...]
 
@@ -332,6 +332,7 @@ final class FishSpeechDualARTransformer: Module {
             vqSum.asType(semanticEmbeddingDType),
             MLXArray.zeros(vqSum.shape, dtype: semanticEmbeddingDType)
         )
+        guard config.scaleCodebookEmbeddings else { return combined }
         let scale = MLXArray(Float(sqrt(Double(numCodebooks + 1)))).asType(semanticEmbeddingDType)
         let scaled = combined / scale
         return MLX.where(semanticMaskExpanded, scaled, combined)

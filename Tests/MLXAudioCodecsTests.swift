@@ -924,6 +924,26 @@ struct DescriptDACTests {
 
 struct FishS1DACTests {
 
+    @Test func testBuildFishS1DACPostModuleOverrides() {
+        var config = FishS1DACBuildConfig()
+        config.quantizerPostTransformerLayers = 8
+        config.quantizerPostTransformerHeads = 16
+        config.quantizerPostTransformerLocalHeads = 8
+        config.quantizerPostTransformerIntermediateSize = 1216
+        let codec = buildFishS1DAC(config)
+
+        let post = codec.quantizer.postModule as! FishS1WindowLimitedTransformer
+        #expect(post.layers.count == 8)
+        #expect(post.layers[0].attention.nHead == 16)
+        #expect(post.layers[0].attention.nLocalHeads == 8)
+        #expect(post.layers[0].feedForward.w1.weight.shape == [1216, 1024])
+
+        let pre = codec.quantizer.preModule as! FishS1WindowLimitedTransformer
+        #expect(pre.layers[0].attention.nHead == 16)
+        #expect(pre.layers[0].attention.nLocalHeads == 16)
+        #expect(pre.layers[0].feedForward.w1.weight.shape == [3072, 1024])
+    }
+
     @Test func testTinyEncodeDecode() throws {
         let quantizer = FishS1DownsampleResidualVectorQuantize(
             inputDim: 16,

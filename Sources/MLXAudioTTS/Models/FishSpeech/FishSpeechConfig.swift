@@ -193,6 +193,9 @@ public struct FishSpeechConfig: Decodable, Sendable {
     public var sampleRate: Int
     public var textConfig: FishTextConfig
     public var audioDecoderConfig: FishAudioDecoderConfig
+    /// Fish S2 divides the summed semantic + codebook embeddings by sqrt(numCodebooks + 1);
+    /// Audio8 (same DualAR layout) does not.
+    public var scaleCodebookEmbeddings: Bool
     public var quantization: BaseConfiguration.Quantization?
     public var perLayerQuantization: BaseConfiguration.PerLayerQuantization?
 
@@ -208,6 +211,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         case sampleRate = "sample_rate"
         case textConfig = "text_config"
         case audioDecoderConfig = "audio_decoder_config"
+        case scaleCodebookEmbeddings = "scale_codebook_embeddings"
         case quantization
         case quantizationConfig = "quantization_config"
     }
@@ -224,6 +228,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         sampleRate: Int = 44_100,
         textConfig: FishTextConfig = FishTextConfig(),
         audioDecoderConfig: FishAudioDecoderConfig = FishAudioDecoderConfig(),
+        scaleCodebookEmbeddings: Bool = true,
         quantization: BaseConfiguration.Quantization? = nil,
         perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
     ) {
@@ -238,6 +243,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         self.sampleRate = sampleRate
         self.textConfig = textConfig
         self.audioDecoderConfig = audioDecoderConfig
+        self.scaleCodebookEmbeddings = scaleCodebookEmbeddings
         self.quantization = quantization
         self.perLayerQuantization = perLayerQuantization
     }
@@ -261,6 +267,8 @@ public struct FishSpeechConfig: Decodable, Sendable {
         self.audioDecoderConfig =
             try container.decodeIfPresent(FishAudioDecoderConfig.self, forKey: .audioDecoderConfig)
             ?? FishAudioDecoderConfig()
+        self.scaleCodebookEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .scaleCodebookEmbeddings) ?? true
 
         let baseConfig = try? BaseConfiguration(from: decoder)
         let globalQuant = try container.decodeIfPresent(

@@ -64,6 +64,11 @@ public struct FishS1DACBuildConfig: Codable {
     public var quantizerTransformerIntermediateSize: Int = 3072
     public var quantizerTransformerHeadDim: Int = 64
     public var quantizerWindowSize: Int = 128
+    /// Post-module overrides (Audio8 slims the post-quantizer transformer); nil = same as pre.
+    public var quantizerPostTransformerLayers: Int? = nil
+    public var quantizerPostTransformerHeads: Int? = nil
+    public var quantizerPostTransformerLocalHeads: Int? = nil
+    public var quantizerPostTransformerIntermediateSize: Int? = nil
     public var transformerBlockSize: Int = 16_384
     public var transformerHeadDim: Int = 64
     public var transformerNormEps: Float = 1e-5

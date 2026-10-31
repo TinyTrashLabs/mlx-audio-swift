@@ -606,9 +606,15 @@ public func buildFishS1DAC(_ config: FishS1DACBuildConfig = FishS1DACBuildConfig
         channelsFirst: true
     )
 
-    let makeTransformer = {
+    var postTransformerArgs = quantizerTransformerArgs
+    if let v = config.quantizerPostTransformerLayers { postTransformerArgs.nLayer = v }
+    if let v = config.quantizerPostTransformerHeads { postTransformerArgs.nHead = v; postTransformerArgs.nLocalHeads = v }
+    if let v = config.quantizerPostTransformerLocalHeads { postTransformerArgs.nLocalHeads = v }
+    if let v = config.quantizerPostTransformerIntermediateSize { postTransformerArgs.intermediateSize = v }
+
+    let makeTransformer = { (args: FishS1DACModelArgs) in
         FishS1WindowLimitedTransformer(
-            config: quantizerTransformerArgs,
+            config: args,
             inputDim: config.latentDim,
             windowSize: config.quantizerWindowSize,
             causal: true
@@ -623,8 +629,8 @@ public func buildFishS1DAC(_ config: FishS1DACBuildConfig = FishS1DACBuildConfig
         semanticCodebookSize: config.semanticCodebookSize,
         downsampleFactor: config.downsampleFactor,
         downsampleDims: config.downsampleDims,
-        preModule: makeTransformer(),
-        postModule: makeTransformer()
+        preModule: makeTransformer(quantizerTransformerArgs),
+        postModule: makeTransformer(postTransformerArgs)
     )
 
     let transformerFactory: FishS1TransformerConfigFactory = { nLayer, nHead, dim, intermediateSize in

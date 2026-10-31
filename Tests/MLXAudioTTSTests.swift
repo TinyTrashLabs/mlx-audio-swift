@@ -1403,6 +1403,54 @@ struct FishSpeechTests {
         #expect(sanitized["model.norm.weight"] != nil)
     }
 
+    @Test func testFishConfigScaleCodebookEmbeddingsDefaultsTrue() throws {
+        let without = try JSONDecoder().decode(FishSpeechConfig.self, from: Data("{}".utf8))
+        #expect(without.scaleCodebookEmbeddings == true)
+
+        let off = try JSONDecoder().decode(
+            FishSpeechConfig.self,
+            from: Data(#"{"scale_codebook_embeddings": false}"#.utf8)
+        )
+        #expect(off.scaleCodebookEmbeddings == false)
+    }
+
+    @Test func testFishEmbedSkipsScaleWhenDisabled() {
+        var config = makeTinyFishSpeechConfig()
+        config.semanticStartTokenID = 20
+        config.semanticEndTokenID = 40
+        let numCodebooks = config.audioDecoderConfig.numCodebooks
+        let vocab = config.audioDecoderConfig.vocabSize
+
+        // [batch, 1 + numCodebooks, seq]: a semantic token at position 0, a plain text token at 1.
+        let input = MLXArray([Int32(25), 3, 4, 7, 5, 6] as [Int32]).reshaped([1, 3, 2])
+
+        func run(scale: Bool) -> (embedded: MLXArray, expected: MLXArray) {
+            config.scaleCodebookEmbeddings = scale
+            let model = FishSpeechModel(config: config)
+            let embedded = model.model.embed(input)
+            var sum = model.model.embeddings(input[0..., 0, 0...])
+            for index in 0 ..< numCodebooks {
+                let row = input[0..., index + 1, 0...] + Int32(index * vocab)
+                sum = sum + MLX.where(
+                    MLXArray([true, false]).reshaped([1, 2, 1]),
+                    model.model.codebookEmbeddings(row),
+                    MLXArray.zeros(sum.shape, dtype: sum.dtype)
+                )
+            }
+            return (embedded, sum)
+        }
+
+        let off = run(scale: false)
+        #expect(allClose(off.embedded, off.expected, atol: 1e-5).item(Bool.self))
+
+        let on = run(scale: true)
+        let divisor = Float(sqrt(Double(numCodebooks + 1)))
+        let scaledPosition = on.expected[0..., 0 ..< 1, 0...] / divisor
+        #expect(allClose(on.embedded[0..., 0 ..< 1, 0...], scaledPosition, atol: 1e-5).item(Bool.self))
+        // The non-semantic position is never scaled.
+        #expect(allClose(on.embedded[0..., 1 ..< 2, 0...], on.expected[0..., 1 ..< 2, 0...], atol: 1e-5).item(Bool.self))
+    }
+
     @Test func testDefaultRepositoryID() {
         #expect(FishSpeechModel.defaultRepositoryID == "mlx-community/fish-audio-s2-pro-8bit")
     }
