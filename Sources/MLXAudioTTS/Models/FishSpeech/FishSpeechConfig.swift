@@ -196,6 +196,9 @@ public struct FishSpeechConfig: Decodable, Sendable {
     /// Fish S2 divides the summed semantic + codebook embeddings by sqrt(numCodebooks + 1);
     /// Audio8 (same DualAR layout) does not.
     public var scaleCodebookEmbeddings: Bool
+    /// Frame budget per target-text token for the generation loop; a render that misses
+    /// its end-of-speech token stops here instead of running on. Fish S2 uses 12.
+    public var maxFramesPerTextToken: Double
     public var quantization: BaseConfiguration.Quantization?
     public var perLayerQuantization: BaseConfiguration.PerLayerQuantization?
 
@@ -212,6 +215,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         case textConfig = "text_config"
         case audioDecoderConfig = "audio_decoder_config"
         case scaleCodebookEmbeddings = "scale_codebook_embeddings"
+        case maxFramesPerTextToken = "max_frames_per_text_token"
         case quantization
         case quantizationConfig = "quantization_config"
     }
@@ -229,6 +233,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         textConfig: FishTextConfig = FishTextConfig(),
         audioDecoderConfig: FishAudioDecoderConfig = FishAudioDecoderConfig(),
         scaleCodebookEmbeddings: Bool = true,
+        maxFramesPerTextToken: Double = 12,
         quantization: BaseConfiguration.Quantization? = nil,
         perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
     ) {
@@ -244,6 +249,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         self.textConfig = textConfig
         self.audioDecoderConfig = audioDecoderConfig
         self.scaleCodebookEmbeddings = scaleCodebookEmbeddings
+        self.maxFramesPerTextToken = maxFramesPerTextToken
         self.quantization = quantization
         self.perLayerQuantization = perLayerQuantization
     }
@@ -269,6 +275,8 @@ public struct FishSpeechConfig: Decodable, Sendable {
             ?? FishAudioDecoderConfig()
         self.scaleCodebookEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .scaleCodebookEmbeddings) ?? true
+        self.maxFramesPerTextToken =
+            try container.decodeIfPresent(Double.self, forKey: .maxFramesPerTextToken) ?? 12
 
         let baseConfig = try? BaseConfiguration(from: decoder)
         let globalQuant = try container.decodeIfPresent(

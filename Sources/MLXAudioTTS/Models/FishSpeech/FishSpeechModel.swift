@@ -845,7 +845,9 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
 
         let imEndID = tokenizer.tokenID(for: fishSpeechIMEndToken) ?? config.eosTokenID
         let textTokenCount = tokenizer.encode(batchText, addSpecialTokens: false).count
-        let semanticBudget = min(maxNewTokens, max(32, textTokenCount * 12))
+        let semanticBudget = fishSpeechSemanticBudget(
+            textTokenCount: textTokenCount, maxNewTokens: maxNewTokens,
+            framesPerTextToken: config.maxFramesPerTextToken)
 
         var previousSemanticTokens: [Int] = []
         var generatedSteps: [[Int32]] = []
@@ -1080,4 +1082,11 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         try await model.postLoadHook(modelDir: modelDir)
         return model
     }
+}
+
+
+/// Frame budget for one generation pass: `framesPerTextToken` frames per target-text token
+/// (floor 32, capped at `maxNewTokens`). Fish S2 uses 12; Audio8 sets a tighter, measured value.
+func fishSpeechSemanticBudget(textTokenCount: Int, maxNewTokens: Int, framesPerTextToken: Double) -> Int {
+    min(maxNewTokens, max(32, Int(ceil(Double(textTokenCount) * framesPerTextToken))))
 }

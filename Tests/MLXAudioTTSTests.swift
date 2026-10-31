@@ -1355,6 +1355,26 @@ struct FishSpeechTests {
         #expect(config.quantization == BaseConfiguration.Quantization(groupSize: 64, bits: 4))
     }
 
+    @Test func testSemanticBudgetDefaultMatchesLegacy() {
+        #expect(fishSpeechSemanticBudget(textTokenCount: 10, maxNewTokens: 1024, framesPerTextToken: 12) == 120)
+        #expect(fishSpeechSemanticBudget(textTokenCount: 2, maxNewTokens: 1024, framesPerTextToken: 12) == 32)
+        #expect(fishSpeechSemanticBudget(textTokenCount: 200, maxNewTokens: 1024, framesPerTextToken: 12) == 1024)
+    }
+
+    @Test func testSemanticBudgetUsesConfigRatio() {
+        #expect(fishSpeechSemanticBudget(textTokenCount: 40, maxNewTokens: 1024, framesPerTextToken: 4.5) == 180)
+    }
+
+    @Test func testConfigDecodesMaxFramesPerTextToken() throws {
+        let absent = try JSONDecoder().decode(
+            FishSpeechConfig.self, from: Data(#"{"model_type":"fish_qwen3_omni"}"#.utf8))
+        #expect(absent.maxFramesPerTextToken == 12)
+        let set = try JSONDecoder().decode(
+            FishSpeechConfig.self,
+            from: Data(#"{"model_type":"fish_qwen3_omni","max_frames_per_text_token":4.5}"#.utf8))
+        #expect(set.maxFramesPerTextToken == 4.5)
+    }
+
     @Test func testConversationEncodingInterleavesSemanticAndCodebookRows() {
         let tokenizer = FakeFishTokenizer()
         let codes = MLXArray([Int32(1), 2, 10, 20]).reshaped([2, 2])
