@@ -131,7 +131,8 @@ public final class FishS1Attention: Module {
         let kvSize = nLocalHeads * headDim
 
         let qkv = wqkv(x)
-        let qkvSplit = qkv.split(indices: [kvSize, 2 * kvSize], axis: -1)
+        let qSize = nHead * headDim
+        let qkvSplit = qkv.split(indices: [qSize, qSize + kvSize], axis: -1)
         var q = qkvSplit[0]
         var k = qkvSplit[1]
         var v = qkvSplit[2]

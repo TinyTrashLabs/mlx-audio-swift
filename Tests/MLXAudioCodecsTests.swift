@@ -924,6 +924,15 @@ struct DescriptDACTests {
 
 struct FishS1DACTests {
 
+    @Test func testFishS1AttentionGroupedQueryShapes() {
+        let attention = FishS1Attention(
+            config: FishS1DACModelArgs(nHead: 16, dim: 1024, nLocalHeads: 8, headDim: 64)
+        )
+        let x = MLXRandom.normal([1, 37, 1024])
+        let y = attention(x, freqsCis: nil, mask: nil)
+        #expect(y.shape == [1, 37, 1024])
+    }
+
     @Test func testBuildFishS1DACPostModuleOverrides() {
         var config = FishS1DACBuildConfig()
         config.quantizerPostTransformerLayers = 8
