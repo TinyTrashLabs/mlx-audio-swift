@@ -199,6 +199,9 @@ public struct FishSpeechConfig: Decodable, Sendable {
     /// Frame budget per target-text token for the generation loop; a render that misses
     /// its end-of-speech token stops here instead of running on. Fish S2 uses 12.
     public var maxFramesPerTextToken: Double
+    /// When set, the per-token frame budget is the reference's own pace (reference frames per
+    /// reference-text token) times this scale, capped at `maxFramesPerTextToken`. nil = off.
+    public var referenceBudgetScale: Double?
     public var quantization: BaseConfiguration.Quantization?
     public var perLayerQuantization: BaseConfiguration.PerLayerQuantization?
 
@@ -216,6 +219,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         case audioDecoderConfig = "audio_decoder_config"
         case scaleCodebookEmbeddings = "scale_codebook_embeddings"
         case maxFramesPerTextToken = "max_frames_per_text_token"
+        case referenceBudgetScale = "reference_budget_scale"
         case quantization
         case quantizationConfig = "quantization_config"
     }
@@ -234,6 +238,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         audioDecoderConfig: FishAudioDecoderConfig = FishAudioDecoderConfig(),
         scaleCodebookEmbeddings: Bool = true,
         maxFramesPerTextToken: Double = 12,
+        referenceBudgetScale: Double? = nil,
         quantization: BaseConfiguration.Quantization? = nil,
         perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
     ) {
@@ -250,6 +255,7 @@ public struct FishSpeechConfig: Decodable, Sendable {
         self.audioDecoderConfig = audioDecoderConfig
         self.scaleCodebookEmbeddings = scaleCodebookEmbeddings
         self.maxFramesPerTextToken = maxFramesPerTextToken
+        self.referenceBudgetScale = referenceBudgetScale
         self.quantization = quantization
         self.perLayerQuantization = perLayerQuantization
     }
@@ -277,6 +283,8 @@ public struct FishSpeechConfig: Decodable, Sendable {
             try container.decodeIfPresent(Bool.self, forKey: .scaleCodebookEmbeddings) ?? true
         self.maxFramesPerTextToken =
             try container.decodeIfPresent(Double.self, forKey: .maxFramesPerTextToken) ?? 12
+        self.referenceBudgetScale =
+            try container.decodeIfPresent(Double.self, forKey: .referenceBudgetScale)
 
         let baseConfig = try? BaseConfiguration(from: decoder)
         let globalQuant = try container.decodeIfPresent(

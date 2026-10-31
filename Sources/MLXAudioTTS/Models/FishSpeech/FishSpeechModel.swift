@@ -816,7 +816,9 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         maxNewTokens: Int,
         topP: Float,
         topK: Int,
-        temperature: Float
+        temperature: Float,
+        refFrames: Int? = nil,
+        refTextTokenCount: Int? = nil
     ) throws -> MLXArray {
         guard let tokenizer else {
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
@@ -845,9 +847,14 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
 
         let imEndID = tokenizer.tokenID(for: fishSpeechIMEndToken) ?? config.eosTokenID
         let textTokenCount = tokenizer.encode(batchText, addSpecialTokens: false).count
+        let framesPerTextToken = config.referenceBudgetScale.map {
+            fishSpeechFramesPerTextToken(
+                refFrames: refFrames, refTextTokenCount: refTextTokenCount,
+                configMax: config.maxFramesPerTextToken, referenceScale: $0)
+        } ?? config.maxFramesPerTextToken
         let semanticBudget = fishSpeechSemanticBudget(
             textTokenCount: textTokenCount, maxNewTokens: maxNewTokens,
-            framesPerTextToken: config.maxFramesPerTextToken)
+            framesPerTextToken: framesPerTextToken)
 
         var previousSemanticTokens: [Int] = []
         var generatedSteps: [[Int32]] = []
@@ -968,12 +975,18 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
 
         var promptTokens: [MLXArray] = []
         var promptTexts: [String] = []
+        var refFrames: Int?
+        var refTextTokenCount: Int?
         if let refAudio {
             let audio = prepareReferencePromptAudio(refAudio)
             let (indices, featureLengths) = codec.encode(audio)
             let promptLength = Int(featureLengths.item(Int32.self))
             promptTokens.append(indices[0, 0..., 0..<promptLength])
             promptTexts.append(refText ?? "")
+            refFrames = promptLength
+            if let refText, !refText.isEmpty {
+                refTextTokenCount = tokenizer.encode(refText, addSpecialTokens: false).count
+            }
         }
 
         let baseConversation = buildConversation(promptTexts: promptTexts, promptTokens: promptTokens)
@@ -1003,7 +1016,9 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                 maxNewTokens: maxTokens,
                 topP: topP,
                 topK: topK,
-                temperature: temperature
+                temperature: temperature,
+                refFrames: refFrames,
+                refTextTokenCount: refTextTokenCount
             )
             try Task.checkCancellation()
             var audio = try decodeCodes(codes)
@@ -1089,4 +1104,16 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
 /// (floor 32, capped at `maxNewTokens`). Fish S2 uses 12; Audio8 sets a tighter, measured value.
 func fishSpeechSemanticBudget(textTokenCount: Int, maxNewTokens: Int, framesPerTextToken: Double) -> Int {
     min(maxNewTokens, max(32, Int(ceil(Double(textTokenCount) * framesPerTextToken))))
+}
+
+/// Per-text-token frame budget scaled to the reference's own pace (reference frames per
+/// reference-text token times `referenceScale`), never above `configMax`. Falls back to
+/// `configMax` when either reference value is missing or not positive.
+func fishSpeechFramesPerTextToken(
+    refFrames: Int?, refTextTokenCount: Int?, configMax: Double, referenceScale: Double
+) -> Double {
+    guard let refFrames, let refTextTokenCount, refFrames > 0, refTextTokenCount > 0 else {
+        return configMax
+    }
+    return min(configMax, Double(refFrames) / Double(refTextTokenCount) * referenceScale)
 }

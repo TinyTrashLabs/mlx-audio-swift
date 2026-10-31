@@ -1375,6 +1375,25 @@ struct FishSpeechTests {
         #expect(set.maxFramesPerTextToken == 4.5)
     }
 
+    @Test func testFramesPerTextTokenFromReference() {
+        #expect(fishSpeechFramesPerTextToken(refFrames: nil, refTextTokenCount: nil, configMax: 12, referenceScale: 1.5) == 12)
+        #expect(fishSpeechFramesPerTextToken(refFrames: 300, refTextTokenCount: 0, configMax: 12, referenceScale: 1.5) == 12)
+        #expect(fishSpeechFramesPerTextToken(refFrames: 300, refTextTokenCount: 60, configMax: 12, referenceScale: 1.5) == 7.5)
+        #expect(fishSpeechFramesPerTextToken(refFrames: 3000, refTextTokenCount: 60, configMax: 12, referenceScale: 1.5) == 12)
+        let r = fishSpeechFramesPerTextToken(refFrames: 300, refTextTokenCount: 60, configMax: 12, referenceScale: 1.5)
+        #expect(fishSpeechSemanticBudget(textTokenCount: 40, maxNewTokens: 1024, framesPerTextToken: r) == 300)
+    }
+
+    @Test func testConfigDecodesReferenceBudgetScale() throws {
+        let absent = try JSONDecoder().decode(
+            FishSpeechConfig.self, from: Data(#"{"model_type":"fish_qwen3_omni"}"#.utf8))
+        #expect(absent.referenceBudgetScale == nil)
+        let set = try JSONDecoder().decode(
+            FishSpeechConfig.self,
+            from: Data(#"{"model_type":"fish_qwen3_omni","reference_budget_scale":1.6}"#.utf8))
+        #expect(set.referenceBudgetScale == 1.6)
+    }
+
     @Test func testConversationEncodingInterleavesSemanticAndCodebookRows() {
         let tokenizer = FakeFishTokenizer()
         let codes = MLXArray([Int32(1), 2, 10, 20]).reshaped([2, 2])
