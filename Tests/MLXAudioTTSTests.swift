@@ -1723,14 +1723,28 @@ struct FishSpeechTests {
     }
 
     @Test func testFishChunkSizeStretchesWhenDecodeDominates() {
-        // Decode cheap: stay at the requested size.
-        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.01, generateSeconds: 1) == 7)
+        // Plenty of lead (30 s): decode cheap stays at the requested size.
+        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.01, generateSeconds: 1, generatedFrames: 7, leadSeconds: 30) == 7)
         // Decode costs more than a tenth of generation: double, capped.
-        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.5, generateSeconds: 1) == 14)
-        #expect(fishNextChunkFrames(current: 80, requested: 7, decodeSeconds: 0.5, generateSeconds: 1) == 100)
+        #expect(fishNextChunkFrames(current: 7, requested: 7, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 7, leadSeconds: 30) == 14)
+        #expect(fishNextChunkFrames(current: 80, requested: 7, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 80, leadSeconds: 30) == 100)
         // Cheap again: halve back, never below the request.
-        #expect(fishNextChunkFrames(current: 56, requested: 7, decodeSeconds: 0.01, generateSeconds: 1) == 28)
-        #expect(fishNextChunkFrames(current: 10, requested: 7, decodeSeconds: 0.01, generateSeconds: 1) == 7)
+        #expect(fishNextChunkFrames(current: 56, requested: 7, decodeSeconds: 0.01, generateSeconds: 1, generatedFrames: 56, leadSeconds: 30) == 28)
+        #expect(fishNextChunkFrames(current: 10, requested: 7, decodeSeconds: 0.01, generateSeconds: 1, generatedFrames: 10, leadSeconds: 30) == 7)
+    }
+
+    @Test func testFishChunkSizeNeverGrowsPastTheLead() {
+        // 22 frames took 1 s (about 0.045 s per frame). Decode dominates, so it wants 44 frames
+        // (2 s + 0.5 s decode + 0.5 margin = 3 s), but only 1.0 s of lead exists: stay small.
+        #expect(fishNextChunkFrames(current: 22, requested: 22, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 22, leadSeconds: 1.0) == 22)
+        // No lead at all (first chunk just went out): never above the request.
+        #expect(fishNextChunkFrames(current: 22, requested: 22, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 22, leadSeconds: 0) == 22)
+        // A big lead lets it grow; a lead that fits 44 frames but not 88 stops at 44.
+        #expect(fishNextChunkFrames(current: 22, requested: 22, decodeSeconds: 0.5, generateSeconds: 1, generatedFrames: 22, leadSeconds: 3.5) == 44)
+        #expect(fishNextChunkFrames(current: 44, requested: 22, decodeSeconds: 0.5, generateSeconds: 2, generatedFrames: 44, leadSeconds: 3.5) == 44)
+        #expect(fishNextChunkFrames(current: 44, requested: 22, decodeSeconds: 0.5, generateSeconds: 2, generatedFrames: 44, leadSeconds: 2.0) == 22)
+        // A grown chunk shrinks when the lead has been used up, but never below the request.
+        #expect(fishNextChunkFrames(current: 100, requested: 22, decodeSeconds: 0.5, generateSeconds: 4.5, generatedFrames: 100, leadSeconds: 0.2) == 22)
     }
 
     @Test func testDefaultRepositoryID() {

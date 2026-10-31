@@ -5,6 +5,7 @@ import MLXAudioCodecs
 import MLXAudioCore
 @preconcurrency import MLXLMCommon
 import MLXNN
+import os
 
 private let fishSpeechRASWindowSize = 10
 private let fishSpeechRASHighTemperature: Float = 1.0
@@ -935,6 +936,13 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
         var previousSemanticTokens: [Int] = []
         var generatedSteps: [[Int32]] = []
         generatedSteps.reserveCapacity(semanticBudget)
+        defer {
+            // Field data for the frame budget: a render that ends at the budget instead of an
+            // end-of-speech token is the long-tail case the budget exists to bound.
+            let produced = generatedSteps.count
+            let actual = Double(produced) / Double(max(1, textTokenCount))
+            fishSpeechLog.info("batch budget=\(semanticBudget) frames=\(produced) textTokens=\(textTokenCount) budgetFramesPerToken=\(framesPerTextToken) actualFramesPerToken=\(actual)")
+        }
 
         for _ in 0 ..< semanticBudget {
             try Task.checkCancellation()
@@ -1110,9 +1118,12 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
             max(1, Int((($0.intervalSeconds * Double(codec.sampleRate)) / Double(codec.frameLength)).rounded()))
         }
         // Decode cost has a fixed part (transformer window + conv margin), so a tiny interval can
-        // cost more than generation; the live chunk size stretches to keep decode a small share.
+        // cost more than generation; the live chunk size stretches to keep decode a small share,
+        // but only while the audio already delivered is ahead of the clock (see fishNextChunkFrames).
         var chunkFrames = requestedChunkFrames ?? 1
         var lastMark = CFAbsoluteTimeGetCurrent()
+        var firstEmitTime: Double?
+        var emittedAudioSeconds = 0.0
         let context = leftContextFrames
         // Deliberate: every batch (not just the first) is primed with the reference tail, the same
         // primer in stream and one-shot, so both decode identically.
@@ -1130,6 +1141,10 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
 
             let startTime = CFAbsoluteTimeGetCurrent()
             var emitted = 0
+            // Each batch starts small again: its first chunk must not inherit a size grown by the
+            // previous batch's final flush, and its generation clock starts now.
+            chunkFrames = requestedChunkFrames ?? 1
+            lastMark = startTime
             let numCodebooks = model.numCodebooks
 
             // Decodes frames [emitted, end) with up to `context` earlier frames (generated ones,
@@ -1164,11 +1179,17 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
                 eval(audio)
                 try Task.checkCancellation()
                 streaming.yield(audio)
+                let newCount = end - emitted
                 emitted = end
                 let now = CFAbsoluteTimeGetCurrent()
+                if firstEmitTime == nil { firstEmitTime = now }
+                emittedAudioSeconds += Double(newCount) * Double(codec.frameLength) / Double(codec.sampleRate)
+                // Lead: audio handed over minus wall time since playback could start.
+                let lead = emittedAudioSeconds - (now - (firstEmitTime ?? now))
                 chunkFrames = fishNextChunkFrames(
                     current: chunkFrames, requested: requestedChunkFrames ?? 1,
-                    decodeSeconds: now - decodeStart, generateSeconds: decodeStart - lastMark)
+                    decodeSeconds: now - decodeStart, generateSeconds: decodeStart - lastMark,
+                    generatedFrames: newCount, leadSeconds: lead)
                 lastMark = now
             }
 
@@ -1306,17 +1327,31 @@ struct FishStreamingSink {
 }
 
 /// Next streaming chunk size in frames. Each chunk's decode has a fixed cost, so when decoding
-/// takes more than a tenth of the time spent generating the chunk, double the size (up to
-/// `maxFrames`); when it is cheap again, halve back toward what the caller asked for.
+/// takes more than a tenth of the time spent generating the chunk, the size doubles (up to
+/// `maxFrames`); when it is cheap again it halves back toward what the caller asked for.
+///
+/// Growth is lead-aware: a chunk of `n` frames arrives about `n * secondsPerFrame + decode` after
+/// the previous one, and playback runs dry if that is longer than the audio already delivered
+/// ahead of the clock (`leadSeconds`). A size is only kept while it fits inside the lead with
+/// `safetyMargin` to spare; otherwise it shrinks (never below `requested`, which is the caller's
+/// own latency choice). With no lead yet (first chunk) the size stays at `requested`.
 func fishNextChunkFrames(
     current: Int, requested: Int, decodeSeconds: Double, generateSeconds: Double,
-    maxFrames: Int = 100
+    generatedFrames: Int, leadSeconds: Double,
+    maxFrames: Int = 100, safetyMargin: Double = 0.5
 ) -> Int {
+    var next = current
     if decodeSeconds > 0.1 * generateSeconds {
-        return min(max(current, requested) * 2, max(maxFrames, requested))
+        next = min(max(current, requested) * 2, max(maxFrames, requested))
+    } else if decodeSeconds < 0.04 * generateSeconds {
+        next = max(requested, current / 2)
     }
-    if decodeSeconds < 0.04 * generateSeconds {
-        return max(requested, current / 2)
+    let secondsPerFrame = generatedFrames > 0 ? generateSeconds / Double(generatedFrames) : 0
+    while next > requested,
+          Double(next) * secondsPerFrame + decodeSeconds + safetyMargin > leadSeconds {
+        next = max(requested, next / 2)
     }
-    return current
+    return next
 }
+
+let fishSpeechLog = Logger(subsystem: "mlx-audio-swift", category: "fish")

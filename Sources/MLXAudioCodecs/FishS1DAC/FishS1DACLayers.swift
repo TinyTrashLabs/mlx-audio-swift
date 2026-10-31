@@ -163,6 +163,8 @@ public final class FishS1ConvTranspose1dTorch: Module, UnaryLayer {
     private(set) var _polyWeight: MLXArray?
 
     func preparePolyphase() {
+        // `outputPadding` is not part of the guard on purpose: it is always 1 here (stride > 1) and
+        // only appends samples after the first `L * stride`, which the causal layer trims anyway.
         guard kernelSize == 2 * stride, stride > 1, groups == 1, dilation == 1, padding == 0 else { return }
         let inCh = weight.dim(0), outCh = weight.dim(1)
         let w4 = weight.reshaped([inCh, outCh, 2, stride]) // kernel index = j * stride + r
