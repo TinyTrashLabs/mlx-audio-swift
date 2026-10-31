@@ -1078,6 +1078,11 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
             throw AudioGenerationError.modelNotInitialized("Codec not loaded")
         }
 
+        if let refCodes, refCodes.ndim != 2 || refCodes.dim(0) != model.numCodebooks || refCodes.dim(1) == 0 {
+            throw AudioGenerationError.invalidInput(
+                "refCodes must be [numCodebooks = \(model.numCodebooks), T > 0]; got \(refCodes.shape)")
+        }
+
         var promptTokens: [MLXArray] = []
         var promptTexts: [String] = []
         var refFrames: Int?
@@ -1105,6 +1110,8 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
             max(1, Int((($0.intervalSeconds * Double(codec.sampleRate)) / Double(codec.frameLength)).rounded()))
         }
         let context = leftContextFrames
+        // Deliberate: every batch (not just the first) is primed with the reference tail, the same
+        // primer in stream and one-shot, so both decode identically.
         let primer = primerTail(refCodes)
 
         for batchText in batches {
@@ -1178,8 +1185,10 @@ public final class FishSpeechModel: Module, SpeechGenerationModel, @unchecked Se
             if streaming != nil {
                 // Final partial chunk; the rest already went out while generating.
                 if emitted < codes.dim(1) {
-                    let steps = (0 ..< codes.dim(1)).map { column in
-                        (0 ..< numCodebooks).map { codes[$0, column].item(Int32.self) }
+                    let frames = codes.dim(1)
+                    let flat = codes.asType(.int32).asArray(Int32.self) // one read, row-major [codebooks, frames]
+                    let steps = (0 ..< frames).map { column in
+                        (0 ..< numCodebooks).map { flat[$0 * frames + column] }
                     }
                     try emitChunk(steps: steps, end: codes.dim(1))
                 }

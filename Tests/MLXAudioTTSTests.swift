@@ -1700,6 +1700,28 @@ struct FishSpeechTests {
         ).item(Bool.self))
     }
 
+    @Test func testFishRefCodesRejectsWrongShape() async throws {
+        MLXRandom.seed(3)
+        let model = makeTinyStreamingFishModel()
+        let good = try model.encodeReference(MLXRandom.normal([44_100]) * 0.1)
+        let transposed = good.transposed(1, 0)
+        await #expect(throws: AudioGenerationError.self) {
+            _ = try await model.generate(
+                text: "hello there", refCodes: transposed, refText: "ref",
+                generationParameters: fishTestParams())
+        }
+        await #expect(throws: AudioGenerationError.self) {
+            _ = try await collectFishStream(model.generateStream(
+                text: "hello there", refCodes: transposed, refText: "ref",
+                generationParameters: fishTestParams(), streamingInterval: 0.5))
+        }
+        await #expect(throws: AudioGenerationError.self) {
+            _ = try await model.generate(
+                text: "hello there", refCodes: good[0..., 0 ..< 0], refText: "ref",
+                generationParameters: fishTestParams())
+        }
+    }
+
     @Test func testDefaultRepositoryID() {
         #expect(FishSpeechModel.defaultRepositoryID == "mlx-community/fish-audio-s2-pro-8bit")
     }
