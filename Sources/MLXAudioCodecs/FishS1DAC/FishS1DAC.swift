@@ -414,6 +414,54 @@ public final class FishS1DAC: Module {
         return (trimmed, audioLengths)
     }
 
+    /// How many earlier code frames a decoded frame can depend on, derived from the decoder stack
+    /// (causal everywhere). Context shorter than this makes `decodeIncremental` approximate;
+    /// at least this much makes it exact.
+    ///
+    /// - post-quantizer transformer: each causal window-`w` layer reaches `w - 1` frames back and
+    ///   the layers compound, so `layers * (w - 1)` frames;
+    /// - upsample stages: a causal ConvNeXt block (k = 7, 6 samples back) at each stage's rate;
+    /// - decoder: input conv (k = 7), then per block a transposed conv (k = 2s, 1 sample back) and
+    ///   residual units with dilations 1, 3, 9 (k = 7, so 6 * 13 = 78 samples back), all at that
+    ///   block's rate. Samples back are converted to frames (rounded up) at the stage's rate.
+    public var decoderReceptiveFieldFrames: Int {
+        var frames = 0
+        if let post = quantizer.postModule as? FishS1WindowLimitedTransformer {
+            guard let window = post.windowSize else { return Int.max }
+            frames += post.layers.count * (window - 1)
+        }
+        // Samples (at the stage's rate) per code frame, walking the upsample stages and decoder.
+        var perFrame = 1
+        for stage in quantizer.upsample {
+            perFrame *= stage.conv.stride
+            frames += (6 + perFrame - 1) / perFrame
+        }
+        frames += (6 + perFrame - 1) / perFrame          // decoder input conv
+        for rate in decoderRates {
+            perFrame *= rate
+            frames += (1 + 78 + perFrame - 1) / perFrame // transposed conv + residual units
+        }
+        return frames
+    }
+
+    /// Decodes the last `newFrames` frames of `codes` (`[1, nCodebooks, T]`) with up to
+    /// `leftContextFrames` earlier frames as context, returning only the new frames' samples
+    /// (`newFrames * frameLength`, 1-D). When `newFrames` is nil the first `leftContextFrames`
+    /// frames are context and the rest are new.
+    public func decodeIncremental(
+        _ codes: MLXArray,
+        leftContextFrames: Int,
+        newFrames: Int? = nil
+    ) -> MLXArray {
+        let total = codes.dim(2)
+        let new = min(max(newFrames ?? (total - leftContextFrames), 0), total)
+        guard new > 0 else { return MLXArray.zeros([0], dtype: .float32) }
+        let context = min(max(leftContextFrames, 0), total - new)
+        let window = codes[0..., 0..., (total - new - context)..<total]
+        let (audio, _) = decode(window, featureLengths: MLXArray([Int32(window.dim(2))]))
+        return audio[0, 0, (context * frameLength)..<((context + new) * frameLength)]
+    }
+
     public func encodeZQ(_ audioData: MLXArray) -> MLXArray {
         let (indices, _) = encode(audioData)
         let semanticIndices = MLX.clip(

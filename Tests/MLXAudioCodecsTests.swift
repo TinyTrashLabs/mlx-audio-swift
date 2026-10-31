@@ -953,6 +953,59 @@ struct FishS1DACTests {
         #expect(pre.layers[0].feedForward.w1.weight.shape == [3072, 1024])
     }
 
+    /// Small causal codec with a window-limited post transformer, random weights, ConvNeXt layer
+    /// scales raised to 1 so context actually matters.
+    private func makeIncrementalTestCodec() -> FishS1DAC {
+        let args = FishS1DACModelArgs(
+            blockSize: 256, nLayer: 2, nHead: 2, dim: 16, intermediateSize: 32, headDim: 8,
+            channelsFirst: true)
+        let quantizer = FishS1DownsampleResidualVectorQuantize(
+            inputDim: 16, nCodebooks: 2, codebookDim: 4, codebookSize: 16,
+            semanticCodebookSize: 32, downsampleFactor: [2, 2],
+            preModule: FishS1Identity(),
+            postModule: FishS1WindowLimitedTransformer(
+                config: args, inputDim: 16, windowSize: 4, causal: true))
+        let model = FishS1DAC(
+            encoderDim: 4, encoderRates: [2, 2], latentDim: 16, decoderDim: 16,
+            decoderRates: [2, 2], quantizer: quantizer, sampleRate: 44_100, causal: true,
+            encoderTransformerLayers: [0, 0], decoderTransformerLayers: [0, 0],
+            transformerConfigFactory: nil)
+        for stage in quantizer.upsample { stage.block.gamma = MLXArray.ones([16]) }
+        eval(model)
+        return model
+    }
+
+    private func incrementalMaxDiff(_ model: FishS1DAC, left: Int, step: Int = 8, frames: Int = 64) -> Float {
+        let codes = MLXRandom.uniform(low: 0, high: 15.99, [1, 3, frames]).asType(.int32)
+        let oneShot = model.decode(codes, featureLengths: MLXArray([Int32(frames)])).0[0, 0]
+        var parts: [MLXArray] = []
+        var end = step
+        while end <= frames {
+            parts.append(model.decodeIncremental(
+                codes[0..., 0..., 0..<end], leftContextFrames: left, newFrames: step))
+            end += step
+        }
+        let joined = concatenated(parts, axis: 0)
+        #expect(joined.shape == oneShot.shape)
+        return abs(joined - oneShot).max().item(Float.self)
+    }
+
+    @Test func testFishS1DACIncrementalDecodeMatchesOneShot() {
+        MLXRandom.seed(3)
+        let model = makeIncrementalTestCodec()
+        let rf = model.decoderReceptiveFieldFrames
+        #expect(rf > 0 && rf < 64)
+        #expect(incrementalMaxDiff(model, left: rf) < 1e-4)
+        // Too little context must visibly differ, or the test proves nothing.
+        #expect(incrementalMaxDiff(model, left: 0) > 1e-4)
+        // newFrames == nil: first `left` frames are context only.
+        let codes = MLXRandom.uniform(low: 0, high: 15.99, [1, 3, 24]).asType(.int32)
+        let full = model.decode(codes, featureLengths: MLXArray([Int32(24)])).0[0, 0]
+        let tail = model.decodeIncremental(codes, leftContextFrames: 16)
+        #expect(tail.shape == [8 * model.frameLength])
+        #expect(allClose(tail, full[(16 * model.frameLength)...], atol: 1e-4).item(Bool.self))
+    }
+
     @Test func testTinyEncodeDecode() throws {
         let quantizer = FishS1DownsampleResidualVectorQuantize(
             inputDim: 16,
