@@ -1006,6 +1006,32 @@ struct FishS1DACTests {
         #expect(allClose(tail, full[(16 * model.frameLength)...], atol: 1e-4).item(Bool.self))
     }
 
+    /// A chunk longer than one conv pass runs in several passes; the join must not change the audio.
+    @Test func testFishS1DACLongChunkDecodesInPassesExactly() {
+        MLXRandom.seed(5)
+        let model = makeIncrementalTestCodec()
+        let rf = model.decoderReceptiveFieldFrames
+        let frames = FishS1DAC.maxNewFramesPerPass * 3 + 5
+        #expect(frames > 2 * FishS1DAC.maxNewFramesPerPass)
+        #expect(incrementalMaxDiff(model, left: rf, step: frames, frames: frames) < 1e-4)
+    }
+
+    /// Folding weight norm at load must give the same audio as recomputing it every call.
+    @Test func testFishS1DACFoldWeightNormKeepsOutput() {
+        MLXRandom.seed(6)
+        let model = makeIncrementalTestCodec()
+        let codes = MLXRandom.uniform(low: 0, high: 15.99, [1, 3, 24]).asType(.int32)
+        let lengths = MLXArray([Int32(24)])
+        let before = model.decode(codes, featureLengths: lengths).0
+        let wave = MLXRandom.uniform(low: -1, high: 1, [1, 1, 4096])
+        let codesBefore = model.encode(wave).0
+        model.foldWeightNorm()
+        model.foldWeightNorm() // idempotent
+        let after = model.decode(codes, featureLengths: lengths).0
+        #expect(allClose(before, after, atol: 1e-5).item(Bool.self))
+        #expect(allClose(codesBefore, model.encode(wave).0).item(Bool.self))
+    }
+
     @Test func testTinyEncodeDecode() throws {
         let quantizer = FishS1DownsampleResidualVectorQuantize(
             inputDim: 16,

@@ -8,6 +8,18 @@ func fishS1NormalizeWeight(_ x: MLXArray, exceptDim: Int = 0) -> MLXArray {
     return MLX.sqrt(MLX.sum(x * x, axes: axes, keepDims: true))
 }
 
+
+/// Weight-norm fold: `g * v / (|v| + eps)`. Computed once at load (`foldWeightNorm`), not on every
+/// call, so a decode does not rebuild every layer's weight (and hold the temporaries) each time.
+@inline(__always)
+func fishS1FoldedWeight(g: MLXArray, v: MLXArray) -> MLXArray {
+    g * v / (fishS1NormalizeWeight(v, exceptDim: 0) + 1e-12)
+}
+
+/// Stand-in for the raw weight-norm parameters once they are folded, so they stop costing memory.
+@inline(__always)
+func fishS1FoldedPlaceholder() -> MLXArray { MLXArray.zeros([1]) }
+
 @inline(__always)
 func fishS1Conv1dTorchToMLX(_ weight: MLXArray) -> MLXArray {
     weight.transposed(0, 2, 1)
@@ -172,6 +184,17 @@ public final class FishS1WNConv1d: Module, UnaryLayer {
     public var weight_g: MLXArray
     public var weight_v: MLXArray
     public var bias: MLXArray?
+    var _foldedWeight: MLXArray?
+
+    /// Replaces `weight_g`/`weight_v` with the single folded weight (see `fishS1FoldedWeight`).
+    public func foldWeightNorm() {
+        guard _foldedWeight == nil else { return }
+        let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
+        eval(w)
+        _foldedWeight = w
+        weight_g = fishS1FoldedPlaceholder()
+        weight_v = fishS1FoldedPlaceholder()
+    }
 
     public init(
         inChannels: Int,
@@ -203,7 +226,7 @@ public final class FishS1WNConv1d: Module, UnaryLayer {
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let xNLC = x.transposed(0, 2, 1)
-        let weight = weight_g * weight_v / (fishS1NormalizeWeight(weight_v, exceptDim: 0) + 1e-12)
+        let weight = _foldedWeight ?? fishS1FoldedWeight(g: weight_g, v: weight_v)
         var y = MLX.conv1d(
             xNLC,
             fishS1Conv1dTorchToMLX(weight),
@@ -230,6 +253,17 @@ public final class FishS1WNConvTranspose1d: Module, UnaryLayer {
     public var weight_g: MLXArray
     public var weight_v: MLXArray
     public var bias: MLXArray?
+    var _foldedWeight: MLXArray?
+
+    /// Replaces `weight_g`/`weight_v` with the single folded weight (see `fishS1FoldedWeight`).
+    public func foldWeightNorm() {
+        guard _foldedWeight == nil else { return }
+        let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
+        eval(w)
+        _foldedWeight = w
+        weight_g = fishS1FoldedPlaceholder()
+        weight_v = fishS1FoldedPlaceholder()
+    }
 
     public init(
         inChannels: Int,
@@ -262,7 +296,7 @@ public final class FishS1WNConvTranspose1d: Module, UnaryLayer {
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let xNLC = x.transposed(0, 2, 1)
-        let weight = weight_g * weight_v / (fishS1NormalizeWeight(weight_v, exceptDim: 0) + 1e-12)
+        let weight = _foldedWeight ?? fishS1FoldedWeight(g: weight_g, v: weight_v)
         var y = MLX.convTransposed1d(
             xNLC,
             fishS1ConvTranspose1dTorchToMLX(weight),
@@ -381,6 +415,20 @@ public final class FishS1CausalWNConv1d: Module, UnaryLayer {
     public var weight_v: MLXArray
     public var bias: MLXArray?
 
+    var _folded = false
+
+    /// Folds weight norm into the inner conv's weight once and drops `weight_g`/`weight_v`.
+    public func foldWeightNorm() {
+        guard !_folded else { return }
+        let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
+        eval(w)
+        conv.conv.weight = w
+        conv.conv.bias = bias
+        weight_g = fishS1FoldedPlaceholder()
+        weight_v = fishS1FoldedPlaceholder()
+        _folded = true
+    }
+
     public init(
         inChannels: Int,
         outChannels: Int,
@@ -410,8 +458,10 @@ public final class FishS1CausalWNConv1d: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        conv.conv.weight = weight_g * weight_v / (fishS1NormalizeWeight(weight_v, exceptDim: 0) + 1e-12)
-        conv.conv.bias = bias
+        if !_folded {
+            conv.conv.weight = fishS1FoldedWeight(g: weight_g, v: weight_v)
+            conv.conv.bias = bias
+        }
         return conv(x)
     }
 }
@@ -422,6 +472,20 @@ public final class FishS1CausalWNConvTranspose1d: Module, UnaryLayer {
     public var weight_g: MLXArray
     public var weight_v: MLXArray
     public var bias: MLXArray?
+
+    var _folded = false
+
+    /// Folds weight norm into the inner conv's weight once and drops `weight_g`/`weight_v`.
+    public func foldWeightNorm() {
+        guard !_folded else { return }
+        let w = fishS1FoldedWeight(g: weight_g, v: weight_v)
+        eval(w)
+        conv.conv.weight = w
+        conv.conv.bias = bias
+        weight_g = fishS1FoldedPlaceholder()
+        weight_v = fishS1FoldedPlaceholder()
+        _folded = true
+    }
 
     public init(
         inChannels: Int,
@@ -452,8 +516,10 @@ public final class FishS1CausalWNConvTranspose1d: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        conv.conv.weight = weight_g * weight_v / (fishS1NormalizeWeight(weight_v, exceptDim: 0) + 1e-12)
-        conv.conv.bias = bias
+        if !_folded {
+            conv.conv.weight = fishS1FoldedWeight(g: weight_g, v: weight_v)
+            conv.conv.bias = bias
+        }
         return conv(x)
     }
 }

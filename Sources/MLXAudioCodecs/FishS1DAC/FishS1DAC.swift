@@ -6,6 +6,11 @@ import MLXNN
 
 public typealias FishS1TransformerConfigFactory = (_ nLayer: Int, _ nHead: Int, _ dim: Int, _ intermediateSize: Int) -> FishS1DACModelArgs
 
+/// Codec layers are evaluated one at a time (only one conv workspace alive). Residual units are
+/// finer-grained and only worth splitting for very long inputs (a reference encode); the streaming
+/// decode chunks stay fused inside a unit.
+let fishS1EvalPerLayerSamples = 100_000
+
 public final class FishS1ResidualUnit: Module, UnaryLayer {
     @ModuleInfo(key: "block") public var block: [Module]
 
@@ -34,6 +39,8 @@ public final class FishS1ResidualUnit: Module, UnaryLayer {
         var y = x
         for layer in block {
             y = fishS1CallUnary(layer, y)
+            // Long inputs (a reference encode) would hold every layer's conv workspace at once.
+            if y.dim(2) > fishS1EvalPerLayerSamples { eval(y) }
         }
 
         let pad = x.shape[2] - y.shape[2]
@@ -110,6 +117,7 @@ public final class FishS1EncoderBlock: Module, UnaryLayer {
         var out = x
         for layer in block {
             out = fishS1CallUnary(layer, out)
+            eval(out) // bound the transient conv workspaces to one layer at a time
         }
         return out
     }
@@ -160,6 +168,7 @@ public final class FishS1Encoder: Module, UnaryLayer {
         var out = x
         for layer in block {
             out = fishS1CallUnary(layer, out)
+            eval(out) // bound the transient conv workspaces to one layer at a time
         }
         return out
     }
@@ -203,6 +212,7 @@ public final class FishS1DecoderBlock: Module, UnaryLayer {
         var out = x
         for layer in block {
             out = fishS1CallUnary(layer, out)
+            eval(out) // bound the transient conv workspaces to one layer at a time
         }
         return out
     }
@@ -251,6 +261,7 @@ public final class FishS1Decoder: Module, UnaryLayer {
         var out = x
         for layer in model {
             out = fishS1CallUnary(layer, out)
+            eval(out) // bound the transient conv workspaces to one layer at a time
         }
         return out
     }
@@ -466,14 +477,45 @@ public final class FishS1DAC: Module {
         // The transformer needs the whole window (its receptive field is long) but is cheap; the
         // conv stages are the cost and only look back `convReceptiveFieldFrames`, so run them on
         // just the new frames plus that margin.
-        var z = quantizer.decodePostModule(window)
-        let keep = min(z.dim(2), new + convReceptiveFieldFrames)
-        z = z[0..., 0..., (z.dim(2) - keep)...]
-        for stage in quantizer.upsample {
-            z = stage(z)
+        let z = quantizer.decodePostModule(window)
+        // The conv stages' workspaces grow with the samples in flight, so a long chunk runs them
+        // in passes of at most `maxNewFramesPerPass` new frames (each with the conv margin in
+        // front: the stages are causal, so this is exact) and bounds the memory peak.
+        let zFrames = z.dim(2)
+        var pieces: [MLXArray] = []
+        var start = zFrames - new
+        while start < zFrames {
+            let end = min(start + Self.maxNewFramesPerPass, zFrames)
+            let from = max(0, start - convReceptiveFieldFrames)
+            var piece = z[0..., 0..., from..<end]
+            for stage in quantizer.upsample {
+                piece = stage(piece)
+            }
+            let audio = decoder(piece)
+            let keep = end - from
+            let out = audio[0, 0, ((keep - (end - start)) * frameLength)..<(keep * frameLength)]
+            if new > Self.maxNewFramesPerPass { eval(out) }
+            pieces.append(out)
+            start = end
         }
-        let audio = decoder(z)
-        return audio[0, 0, ((keep - new) * frameLength)..<(keep * frameLength)]
+        return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
+    }
+
+    /// Most new frames the conv stages decode in one pass (see `decodeIncremental`).
+    static let maxNewFramesPerPass = 32
+
+    /// Folds every weight-normed conv once (weight = g * v / |v|) so encode/decode stop recomputing
+    /// each layer's weight, and the raw g/v stop taking memory.
+    public func foldWeightNorm() {
+        for (_, module) in namedModules() {
+            switch module {
+            case let m as FishS1CausalWNConv1d: m.foldWeightNorm()
+            case let m as FishS1CausalWNConvTranspose1d: m.foldWeightNorm()
+            case let m as FishS1WNConv1d: m.foldWeightNorm()
+            case let m as FishS1WNConvTranspose1d: m.foldWeightNorm()
+            default: break
+            }
+        }
     }
 
     public func encodeZQ(_ audioData: MLXArray) -> MLXArray {
@@ -629,6 +671,7 @@ public final class FishS1DAC: Module {
 
         let weights = model.sanitize(weights: try loadArrays(url: weightsURL))
         try model.update(parameters: ModuleParameters.unflattened(weights), verify: .noUnusedKeys)
+        model.foldWeightNorm()
         eval(model.parameters())
         return model
     }
